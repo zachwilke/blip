@@ -161,8 +161,15 @@ FocusScope {
   property var fetchQueue: []
   property string fetchingId: ""
   // Compose draft attachment (one per message in v1).
-  property string draftPath: ""
-  property string draftLabel: ""
+  // Queued attachments, oldest first: [{ path, label }]. A single draft could
+  // only ever ship the first of five dropped photos, silently discarding the
+  // rest — a drop that loses four files with no message is worse than a
+  // refusal. Sends go out one part per file, in this order.
+  property var drafts: []
+  readonly property int draftCount: drafts.length
+  /** How many files one message may carry. A stray drop of a whole folder
+   *  should be refused, not turned into eighty sends. */
+  readonly property int draftMax: 10
   // What the in-flight file send / paste belong to, so late completions
   // can't clobber a NEWER draft or land in a DIFFERENT conversation.
   property string sendDraftPath: ""
@@ -272,6 +279,15 @@ FocusScope {
   // Text sends queue instead of refusing while one is on the wire; each gets
   // its bubble the instant Enter is pressed (see pendingSends).
   property var sendQueue: []
+  // Files still to ship for the send in flight: one part per file, in order.
+  // The caption rides the FIRST part only — repeating it on each would post
+  // the same sentence five times.
+  property var fileQueue: []
+  property string sendCaption: ""
+  // The service is captured when the batch STARTS, never re-read per part:
+  // root.active can change under a multi-part send, and a later part must not
+  // go out on a different service from the first (war room #2).
+  property string sendService: ""
   // Sends the Mac has not written a row for yet, {chat, text, ts}. Every
   // thread reload carries them to thread.ts (--pending-stdin, never argv),
   // which keeps their bubbles until the real row lands. Memory only.
@@ -656,18 +672,41 @@ FocusScope {
 
   // ------------------------------------------------------ compose attachment
 
-  function setDraft(path) {
+  /** Queue one more file on the draft. The same path twice is one attachment. */
+  function addDraft(path) {
     var p = String(path || "")
     if (p === "") return
-    draftPath = p
+    for (var i = 0; i < root.drafts.length; i++) if (root.drafts[i].path === p) return
+    if (root.drafts.length >= root.draftMax) {
+      root.note = "at most " + root.draftMax + " files per message"
+      return
+    }
     var parts = p.split("/")
-    draftLabel = parts[parts.length - 1] || "file"
+    root.drafts = root.drafts.concat([{ path: p, label: parts[parts.length - 1] || "file" }])
     Qt.callLater(function() { composeField.forceActiveFocus() })
   }
 
+  /** Queue several at once — a multi-file drop. Reports what would not fit
+   *  rather than dropping it on the floor. */
+  function addDrafts(paths) {
+    var before = root.drafts.length
+    for (var i = 0; i < (paths || []).length; i++) {
+      if (root.drafts.length >= root.draftMax) {
+        root.note = "attached " + (root.drafts.length - before) + " — at most "
+                  + root.draftMax + " files per message"
+        return
+      }
+      root.addDraft(paths[i])
+    }
+  }
+
+  function removeDraft(path) {
+    root.drafts = root.drafts.filter(function(d) { return d.path !== String(path) })
+  }
+
   function clearDraft() {
-    draftPath = ""
-    draftLabel = ""
+    root.drafts = []
+    root.fileQueue = []
   }
 
   function startPaste() {
@@ -996,35 +1035,35 @@ FocusScope {
     if (trimmed.indexOf("/attach ") === 0) {
       var p = trimmed.slice(8).trim()
       if (p.indexOf("~/") === 0) p = root.home + p.slice(1)
-      setDraft(p)
+      addDraft(p)
       composeField.text = ""
-      note = "attached — type a caption or press Enter to send"
+      note = root.draftCount > 1
+        ? root.draftCount + " files attached — caption, or Enter to send"
+        : "attached — type a caption or press Enter to send"
       return
     }
 
-    if (draftPath === "" && trimmed === "") return
+    if (root.draftCount === 0 && trimmed === "") return
     if (!isSendable(root.active)) {
       note = "Read-only — group id unknown — send from your phone"
       return
     }
 
-    if (draftPath !== "") {
+    if (root.draftCount > 0) {
       if (sendProc.running || fileSendProc.running) {
         note = "a message is already sending"
         return
       }
-      note = "sending…"
       sendChat = String(root.active.chat)
       sendText = text
-      // send-file.ts owns target resolution (group guid or DM handle).
-      sendDraftPath = draftPath
-      // caption on stdin — never in this process's argv (audit #4, war room #1/#13)
-      fileSendProc.command = ["bun", root.sendFileScript, sendChat, draftPath, "--caption-stdin"]
-        .concat(/^(SMS|RCS)$/i.test(String(root.active.service || "")) ? ["--service", String(root.active.service).toUpperCase()] : [])
-      fileSendProc.stdinEnabled = true
-      fileSendProc.running = true
-      fileSendProc.write(trimmed !== "" ? text : "")
-      fileSendProc.stdinEnabled = false
+      // One part per file, in the order they were queued; the caption goes
+      // with the first only. fileSendProc is a single Process, so they ship
+      // strictly one at a time — pumpFileSend() starts the next as each lands.
+      root.fileQueue = root.drafts.map(function(d) { return d.path })
+      root.sendCaption = trimmed
+      var svc = String(root.active.service || "")
+      root.sendService = /^(SMS|RCS)$/i.test(svc) ? svc.toUpperCase() : ""
+      pumpFileSend()
       return
     }
 
@@ -1111,6 +1150,27 @@ FocusScope {
     sendProc.running = true
     sendProc.write(job.text)
     sendProc.stdinEnabled = false
+  }
+
+  /** Ship the next queued file. The caption rides the FIRST part only, and
+   *  goes over stdin — never this process's argv (audit #4, war room #1/#13). */
+  function pumpFileSend() {
+    if (fileSendProc.running) return
+    if (root.fileQueue.length === 0) return
+    var path = root.fileQueue[0]
+    root.fileQueue = root.fileQueue.slice(1)
+    root.sendDraftPath = path
+    var left = root.fileQueue.length
+    root.note = left > 0 ? "sending… (" + (left + 1) + " left)" : "sending…"
+    // send-file.ts owns target resolution (group guid or DM handle).
+    fileSendProc.command = ["bun", root.sendFileScript, root.sendChat, path, "--caption-stdin"]
+      .concat(root.sendService !== "" ? ["--service", root.sendService] : [])
+    fileSendProc.stdinEnabled = true
+    fileSendProc.running = true
+    fileSendProc.write(root.sendCaption)
+    fileSendProc.stdinEnabled = false
+    // Spent: only the first part carries it.
+    root.sendCaption = ""
   }
 
   Process { id: copyProc }
@@ -1321,7 +1381,7 @@ FocusScope {
         if (!root.inThread || String(root.active.chat) !== root.pasteChat) return
         try {
           var d = JSON.parse(text.trim())
-          if (d.kind === "image" || d.kind === "file") root.setDraft(String(d.path || ""))
+          if (d.kind === "image" || d.kind === "file") root.addDraft(String(d.path || ""))
           else if (d.kind === "text") {
             composeField.insert(composeField.cursorPosition, String(d.text || ""))
           }
@@ -1343,18 +1403,33 @@ FocusScope {
           if (!ok) err = d.online === false ? "not sent — Mac unreachable" : String(d.error || err)
         } catch (e) { /* fall through */ }
         if (ok) {
-          // Only clear the draft this send actually shipped — the user may
-          // have queued a NEWER file while this one was in flight.
-          if (root.draftPath === root.sendDraftPath) root.clearDraft()
+          // Retire only the part that actually shipped — the user may have
+          // queued another file while this one was in flight.
+          root.removeDraft(root.sendDraftPath)
+          root.sendDraftPath = ""
+          root.reloadChat = root.sendChat
+          reloadTimer.restart()
+          if (root.fileQueue.length > 0) {
+            // More parts to go: keep sendChat/sendText, do NOT clear the
+            // field or hand focus back mid-batch.
+            root.pumpFileSend()
+            return
+          }
           if (belongsHere) {
             root.note = ""
             if (composeField.text === root.sendText) composeField.text = ""
           }
-          root.reloadChat = root.sendChat
-          reloadTimer.restart()
         } else if (belongsHere) {
-          root.note = err
+          // Stop the batch: the parts still queued stay attached, so the user
+          // can retry them rather than hunt for which of five went out.
+          var left = root.fileQueue.length
+          root.note = left > 0 ? err + " — " + (left + 1) + " still attached" : err
+          root.fileQueue = []
+          root.sendDraftPath = ""
         }
+        root.fileQueue = []
+        root.sendCaption = ""
+        root.sendService = ""
         root.sendChat = ""
         root.sendText = ""
         if (belongsHere) composeField.forceActiveFocus()
@@ -1515,7 +1590,7 @@ FocusScope {
       || (text >= "1" && text <= "9")
     if (!jump) return false
     if (searchField.activeFocus || newField.activeFocus || bubbleFocused) return false
-    if (composeField.activeFocus && (composeField.text.length > 0 || root.draftPath !== ""))
+    if (composeField.activeFocus && (composeField.text.length > 0 || root.draftCount > 0))
       return false
     return handleTextKey(text) === true
   }
@@ -2854,32 +2929,47 @@ FocusScope {
           foreground: root.foreground
         }
 
-        // queued attachment — one per message; ✕ removes it
-        RowLayout {
+        // queued attachments — ✕ removes one. ONE CHIP PER ROW, never a
+        // RowLayout of N: summed implicit widths stretch the whole column
+        // past the panel and take every right-aligned element off-screen
+        // with it (CLAUDE.md; the same rule the received chips follow).
+        ColumnLayout {
+          id: draftList
           Layout.fillWidth: true
-          visible: root.inThread && root.draftPath !== ""
-          spacing: 0
-          Rectangle {
-            Layout.preferredWidth: Math.ceil(draftText.implicitWidth) + Style.space(18)
-            Layout.preferredHeight: Math.ceil(draftText.implicitHeight) + Style.space(12)
-            radius: Style.space(14)
-            color: root.mineFill
-            opacity: 0.9
-            Text {
-              id: draftText
-              anchors.centerIn: parent
-              text: "📎 " + (root.draftLabel.length > 40
-                              ? root.draftLabel.slice(0, 37) + "…"
-                              : root.draftLabel) + "   ✕"
-              textFormat: Text.PlainText
-              color: root.mineText
-              font.family: root.fontFamily
-              font.pixelSize: root.fontCaption
+          visible: root.inThread && root.draftCount > 0
+          spacing: Style.space(4)
+          Repeater {
+            model: root.drafts
+            delegate: RowLayout {
+              required property var modelData
+              Layout.fillWidth: true
+              spacing: 0
+              Rectangle {
+                // Capped at the compose column: a long filename must not
+                // push the row wider than the panel.
+                Layout.preferredWidth: Math.min(
+                  Math.ceil(draftText.implicitWidth) + Style.space(18),
+                  draftList.width)
+                Layout.preferredHeight: Math.ceil(draftText.implicitHeight) + Style.space(12)
+                radius: Style.space(14)
+                color: root.mineFill
+                opacity: 0.9
+                Text {
+                  id: draftText
+                  anchors.centerIn: parent
+                  readonly property string label: String(modelData.label || "file")
+                  text: "📎 " + (label.length > 40 ? label.slice(0, 37) + "…" : label) + "   ✕"
+                  textFormat: Text.PlainText
+                  color: root.mineText
+                  font.family: root.fontFamily
+                  font.pixelSize: root.fontCaption
+                }
+                HoverHandler { cursorShape: Qt.PointingHandCursor }
+                TapHandler { onTapped: root.removeDraft(modelData.path) }
+              }
+              Item { Layout.fillWidth: true }
             }
-            HoverHandler { cursorShape: Qt.PointingHandCursor }
-            TapHandler { onTapped: root.clearDraft() }
           }
-          Item { Layout.fillWidth: true }
         }
 
         RowLayout {
@@ -2915,7 +3005,7 @@ FocusScope {
               // instead; send() is the authoritative online/sendability guard.
               enabled: true
               readOnly: !root.online || !root.isSendable(root.active)
-              placeholderText: root.draftPath !== ""
+              placeholderText: root.draftCount > 0
                 ? "caption (optional) — Enter sends the file"
                 : root.isSendable(root.active) ? "iMessage" : "Read-only — group id unknown"
               color: root.foreground
@@ -2962,7 +3052,7 @@ FocusScope {
           // send button — the blue arrow circle (lit when text OR a file is queued)
           Rectangle {
             Layout.alignment: Qt.AlignBottom
-            readonly property bool armed: composeField.text.trim() !== "" || root.draftPath !== ""
+            readonly property bool armed: composeField.text.trim() !== "" || root.draftCount > 0
             width: Style.space(28); height: width; radius: width / 2
             color: armed ? root.mineFill : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.15)
             Text {
@@ -2998,9 +3088,16 @@ FocusScope {
       keys: ["text/uri-list"]
       onDropped: (drop) => {
         if (!drop.hasUrls || drop.urls.length === 0) return
-        var u = String(drop.urls[0])
-        if (u.indexOf("file://") !== 0) return
-        root.setDraft(decodeURIComponent(u.replace(/^file:\/\//, "")))
+        // EVERY dropped file, not just urls[0]: dropping five photos used to
+        // attach one and discard four without saying so.
+        var paths = []
+        for (var i = 0; i < drop.urls.length; i++) {
+          var u = String(drop.urls[i])
+          if (u.indexOf("file://") !== 0) continue
+          paths.push(decodeURIComponent(u.replace(/^file:\/\//, "")))
+        }
+        if (paths.length === 0) return
+        root.addDrafts(paths)
         drop.accept()
       }
     }
