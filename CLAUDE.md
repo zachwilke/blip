@@ -496,7 +496,11 @@ what it is handed. Keep it that way.
   answers only peers with its uid (SO_PEERCRED). `existsSync` is not a check.
   (5) Every wait on the Mac has a deadline (spawn handshake, write, the whole
   reply; 12 s): a silent half-open peer costs one deadline, then that ssh
-  child is killed and reaped and the slot is free. At most 4 clients queue;
+  child is killed and reaped, its ControlMaster is released (`ssh -O exit`
+  plus unlink — ConnectTimeout does not apply to a wedged mux), and the
+  slot is free. The shim carries the same ServerAliveInterval=10/CountMax=2
+  so a one-shot through a mux the daemon did not start (watch) also dies.
+  At most 4 clients queue;
   the rest get a fallback frame at once. The daemon prepends the shim's
   `--hide-spam`/`--hide-unknown`, reading bridge.conf per request as the shim
   does — `test_bridged.py` runs the real shim against a fake ssh and compares.

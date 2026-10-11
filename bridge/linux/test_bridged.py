@@ -193,6 +193,61 @@ class Deadlines(unittest.TestCase):
         self.assertEqual(cmd[-2:], ["you@your-mac",
                                     "PATH=/opt/homebrew/bin:/usr/local/bin:$PATH python3 $HOME/.blip/bin/imsg serve"])
 
+    def test_a_wedged_mux_is_unlinked_so_the_next_ssh_is_a_new_syn(self):
+        # ControlPersist leaves the master after SIGKILL of the session.
+        # ConnectTimeout does not apply to a client that attaches to it.
+        with tempfile.TemporaryDirectory() as tmp:
+            sock = os.path.join(tmp, "cm-blip-you@your-mac:22")
+            open(sock, "w").close()
+            ran = []
+
+            def run(cmd, **_kw):
+                ran.append(cmd)
+                raise subprocess.TimeoutExpired(cmd, 1)
+
+            bridged.release_mux("you@your-mac", "/nonexistent/key",
+                                os.path.join(tmp, "cm-blip-%r@%h:%p"),
+                                run=run, sockets=[sock])
+            self.assertTrue(any("-O" in c and "exit" in c for c in ran))
+            self.assertFalse(os.path.exists(sock))
+
+    def test_killing_a_dedicated_key_channel_releases_the_mux(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            key = os.path.join(tmp, "blip_ed25519")
+            open(key, "w").close()
+            spawn = Spawner("stall")
+            ch = bridged.Channel(popen=spawn)
+            ch._spawn(conf(key=key), time.monotonic() + 5)
+            self.assertTrue(spawn.procs[0].killed is False)
+            released = []
+
+            def fake_release(host, key_path, path, **_kw):
+                released.append((host, key_path, path))
+
+            saved = bridged.release_mux
+            bridged.release_mux = fake_release
+            try:
+                ch.kill()
+            finally:
+                bridged.release_mux = saved
+            self.assertTrue(spawn.procs[0].killed and spawn.procs[0].reaped)
+            self.assertEqual(len(released), 1)
+            self.assertEqual(released[0][0], "you@your-mac")
+            self.assertEqual(released[0][1], key)
+
+    def test_killing_a_general_key_channel_does_not_touch_the_operator_mux(self):
+        spawn = Spawner("stall")
+        ch = bridged.Channel(popen=spawn)
+        ch._spawn(conf(), time.monotonic() + 5)
+        released = []
+        saved = bridged.release_mux
+        bridged.release_mux = lambda *a, **k: released.append(a)
+        try:
+            ch.kill()
+        finally:
+            bridged.release_mux = saved
+        self.assertEqual(released, [])
+
 
 class PoolLimits(unittest.TestCase):
     def pool(self, *modes, max_queued=0):
@@ -309,6 +364,29 @@ class FilterParity(unittest.TestCase):
         for line in (b"not json", b'{"argv":"--json"}', b'{"argv":[1]}', b'{"argv":[],"stdin":3}', b"[]"):
             reply = bridged.answer(line, bridged.Pool(size=1), lambda: conf())
             self.assertTrue(json.loads(reply.split(b"\n", 1)[0])["fallback"], line)
+
+    def test_the_one_shot_path_carries_keepalives(self):
+        # ConnectTimeout covers a new SYN. A mux through a blackholed
+        # master ignores it; ServerAlive is what notices, same values as
+        # the serve channel.
+        with tempfile.TemporaryDirectory() as tmp:
+            shutil.copy(HERE / "blip-shim", os.path.join(tmp, "imsg"))
+            os.chmod(os.path.join(tmp, "imsg"), 0o755)
+            log = os.path.join(tmp, "ssh.log")
+            with open(os.path.join(tmp, "ssh"), "w") as fh:
+                fh.write(f'#!/bin/sh\nprintf "%s\\n" "$@" > "{log}"\n')
+            os.chmod(os.path.join(tmp, "ssh"), 0o755)
+            with open(os.path.join(tmp, "bridge.conf"), "w") as fh:
+                fh.write(f"host=you@your-mac\nkey={tmp}/no-key\n")
+            env = {"PATH": f"{tmp}:/usr/bin:/bin", "HOME": tmp,
+                   "BLIP_BRIDGE_CONF": os.path.join(tmp, "bridge.conf")}
+            subprocess.run([os.path.join(tmp, "imsg"), "--json", "recent", "5"],
+                           env=env, check=True)
+            with open(log) as fh:
+                logged = fh.read()
+            self.assertIn("ServerAliveInterval=10", logged)
+            self.assertIn("ServerAliveCountMax=2", logged)
+            self.assertIn("ConnectTimeout=5", logged)
 
     def test_the_mac_host_override_matches_the_shim(self):
         with tempfile.TemporaryDirectory() as tmp:

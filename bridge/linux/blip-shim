@@ -109,7 +109,12 @@ fi
 # Not exec: we need the exit code to translate it. stdio is inherited either
 # way, so attachment streaming and --file-stdin are untouched.
 set +e
-"${ssh[@]}" -o ConnectTimeout=5 -o BatchMode=yes -- "$host" "$remote"
+# ConnectTimeout is the SYN. A ControlMaster client through a blackholed
+# master never SYNs — ServerAlive is what notices, the same values the
+# serve channel already carries. Without it a Wi-Fi DROP hangs the one-shot
+# fallback until the collector's 15 s hammer.
+"${ssh[@]}" -o ConnectTimeout=5 -o BatchMode=yes \
+  -o ServerAliveInterval=10 -o ServerAliveCountMax=2 -- "$host" "$remote"
 rc=$?
 set -e
 if (( rc == 255 )); then

@@ -11,6 +11,7 @@ import os
 import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -40,14 +41,12 @@ def daemon_pid() -> int | None:
 
 
 def daemon_alive() -> bool:
+    """/proc, not kill(pid,0): the poller is unprivileged and the recorded
+    pid may be the root sudo wrapper, which returns EPERM and looks dead."""
     pid = daemon_pid()
     if pid is None:
         return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
+    return Path(f"/proc/{pid}").exists()
 
 
 def blackhole(on: bool) -> None:
@@ -95,7 +94,13 @@ def warm_once() -> dict:
         meta = json.loads(head)
         ms = (time.monotonic() - t0) * 1000
         if meta.get("fallback") is True:
-            return {"path": "fallback", "ms": ms, "ok": False, "reason": raw.split(b"\n", 1)[-1].decode("utf-8", "replace").strip()}
+            return {
+                "path": "fallback",
+                "ms": ms,
+                "ok": False,
+                "fell_back": True,
+                "reason": raw.split(b"\n", 1)[-1].decode("utf-8", "replace").strip(),
+            }
         if meta.get("status") == 0:
             return {"path": "warm", "ms": ms, "ok": True, "reason": ""}
         return {"path": "warm-err", "ms": ms, "ok": False, "reason": f"status {meta.get('status')}"}
@@ -112,18 +117,33 @@ def oneshot_once() -> dict:
         "-o", f"ControlPath={os.path.expanduser('~')}/.ssh/cm-blip-%r@%h:%p",
         "-o", "ControlPersist=10m",
         "-o", "ConnectTimeout=5", "-o", "BatchMode=yes",
+        "-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=2",
         "--", f"{USER}@{MAC_IP}", "imsg --json recent 5",
     ]
     try:
         r = subprocess.run(cmd, capture_output=True, timeout=ONESHOT_TIMEOUT)
         ms = (time.monotonic() - t0) * 1000
+        err = (r.stderr or b"").decode("utf-8", "replace").strip().splitlines()
+        tail = err[-1] if err else ""
         if r.returncode == 0:
             return {"path": "oneshot", "ms": ms, "ok": True, "reason": ""}
-        return {"path": "oneshot-err", "ms": ms, "ok": False, "reason": f"exit {r.returncode}"}
+        return {"path": "oneshot-err", "ms": ms, "ok": False, "reason": f"exit {r.returncode} {tail}"}
     except subprocess.TimeoutExpired:
         return {"path": "oneshot-hang", "ms": (time.monotonic() - t0) * 1000, "ok": False, "reason": "oneshot exceeded 15s"}
     except Exception as e:
         return {"path": "oneshot-err", "ms": (time.monotonic() - t0) * 1000, "ok": False, "reason": f"{type(e).__name__}: {e}"}
+
+
+def mux_state() -> dict:
+    """What ControlMaster sockets and ssh children look like right now."""
+    home = Path.home()
+    socks = [p.name for p in home.joinpath(".ssh").glob("cm-blip-*")]
+    try:
+        ps = subprocess.check_output(["ps", "-u", USER, "-o", "pid,cmd", "--no-headers"], text=True)
+    except subprocess.CalledProcessError:
+        ps = ""
+    ssh = [ln.strip() for ln in ps.splitlines() if "ssh" in ln and "blackhole" not in ln]
+    return {"control_sockets": socks, "ssh": ssh}
 
 
 def collector_once() -> dict:
@@ -137,6 +157,8 @@ def collector_once() -> dict:
     one["total_ms"] = (time.monotonic() - t0) * 1000
     one["warm"] = warm
     one["fell_back"] = True
+    one["warm_ms"] = warm["ms"]
+    one["mux"] = mux_state()
     return one
 
 
@@ -160,17 +182,22 @@ class Watch:
         if not self.saw_dead:
             self.saw_dead = True
             self.died_at = time.monotonic() - t0
-            # BarWidget: onExited → 30 s timer → running = true
-            time.sleep(BAR_RESTART_S)
-            restart_daemon()
-            self.restarted_at = time.monotonic() - t0
+            # Record only. Restarting here would sleep 30 s inside the
+            # sample and kill a daemon the poller merely could not signal.
 
 
 def summarize(name: str, polls: list[dict], watch: Watch, outage_s: float) -> dict:
     totals = [p.get("total_ms", p["ms"]) for p in polls]
     hung = [p for p in polls if p.get("total_ms", p["ms"]) >= HANG_S * 1000 or p["path"] == "oneshot-hang"]
     fallbacks = [p for p in polls if p.get("fell_back") or p["path"] == "fallback"]
-    first_fallback = fallbacks[0].get("at_s") if fallbacks else None
+    first_fallback = None
+    if fallbacks:
+        p = fallbacks[0]
+        # When the warm side gave up, not when the oneshot finished.
+        warm_ms = p.get("warm_ms") or p.get("warm", {}).get("ms") or p["ms"]
+        first_fallback = p.get("at_s", 0) - (p.get("total_ms", p["ms"]) - warm_ms) / 1000
+        if first_fallback < 0:
+            first_fallback = p.get("at_s")
     worst = max(totals) if totals else None
     errors = [p for p in polls if not p.get("ok") and p["path"] not in ("fallback", "oneshot-err")]
     # oneshot-err during the outage is the expected offline
@@ -196,6 +223,15 @@ def run_outage(name: str, seconds: float) -> tuple[dict, list[dict], dict]:
     polls: list[dict] = []
     t0 = time.monotonic()
     blackhole(True)
+    # Lift on a timer, not after the in-flight poll returns — a 5 s outage
+    # would otherwise stay DROPped for the whole 12 s deadline.
+    def _lift() -> None:
+        remaining = seconds - (time.monotonic() - t0)
+        if remaining > 0:
+            time.sleep(remaining)
+        blackhole(False)
+        print(f"  blackhole lifted at {time.monotonic()-t0:.2f}s", flush=True)
+    threading.Thread(target=_lift, daemon=True).start()
     while time.monotonic() - t0 < seconds:
         p = collector_once()
         p["at_s"] = time.monotonic() - t0
@@ -304,6 +340,31 @@ def main() -> int:
     print(f"baseline warm avg {base['warm_avg_ms']} ms  (first {base['first_ms']} ms); "
           f"one-shot avg {base['oneshot_avg_ms']} ms", flush=True)
     print(f"daemon alive={daemon_alive()} pid={daemon_pid()}", flush=True)
+    print(f"mux after baseline {mux_state()}", flush=True)
+
+    print("\n--- probes during DROP (not part of the timed outages) ---", flush=True)
+    blackhole(True)
+    for label, extra in (
+        ("connect-timeout-only", ["-o", "ControlMaster=no", "-o", "ConnectTimeout=5"]),
+        ("shim-mux", ["-o", "ControlMaster=auto",
+                      "-o", f"ControlPath={os.path.expanduser('~')}/.ssh/cm-blip-%r@%h:%p",
+                      "-o", "ControlPersist=10m", "-o", "ConnectTimeout=5"]),
+    ):
+        pt0 = time.monotonic()
+        try:
+            r = subprocess.run(
+                ["ssh", "-i", KEY, "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
+                 *extra, "--", f"{USER}@{MAC_IP}", "imsg --json recent 5"],
+                capture_output=True, timeout=12)
+            print(f"  probe {label}: {(time.monotonic()-pt0)*1000:.0f}ms exit={r.returncode} "
+                  f"{(r.stderr or b'').decode('utf-8','replace').strip().splitlines()[-1:]}",
+                  flush=True)
+        except subprocess.TimeoutExpired:
+            print(f"  probe {label}: hung >12s mux={mux_state()}", flush=True)
+    blackhole(False)
+    # Re-warm so the timed outages start from a live channel.
+    collector_once()
+    print(f"rewarmed; mux {mux_state()}", flush=True)
 
     short = short_rec = None
     if SHORT_SECS > 0:

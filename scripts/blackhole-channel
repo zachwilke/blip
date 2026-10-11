@@ -83,6 +83,7 @@ cleanup() {
     kill "$SSHD_PID" 2>/dev/null
     wait "$SSHD_PID" 2>/dev/null
   fi
+  pkill -f "sshd -f $WORKDIR/sshd/sshd_config" 2>/dev/null
   iptables -D OUTPUT -j "$CHAIN" 2>/dev/null
   iptables -D INPUT -j "$CHAIN" 2>/dev/null
   iptables -F "$CHAIN" 2>/dev/null
@@ -93,8 +94,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-mkdir -p "$WORKDIR"/{home/.ssh,home/.config/blip,run/blip,sshd}
-chmod 700 "$WORKDIR" "$WORKDIR/home" "$WORKDIR/home/.ssh" "$WORKDIR/run" "$WORKDIR/run/blip"
+mkdir -p "$WORKDIR"/{home/.ssh,home/.config/blip,run/blip,sshd,bin}
+# sshd will not write a pid file into a directory another user can write.
+chmod 755 "$WORKDIR" "$WORKDIR/sshd"
+chmod 700 "$WORKDIR/home" "$WORKDIR/home/.ssh" "$WORKDIR/run" "$WORKDIR/run/blip"
+chown "$USER_UID:$USER_GID" "$WORKDIR/home" "$WORKDIR/home/.ssh" "$WORKDIR/run" "$WORKDIR/run/blip"
 
 # --- ssh identities -------------------------------------------------------
 sudo -u "$USER_NAME" ssh-keygen -t ed25519 -N "" -f "$WORKDIR/home/.ssh/blip_ed25519" -q
@@ -102,7 +106,8 @@ sudo -u "$USER_NAME" ssh-keygen -t ed25519 -N "" -f "$WORKDIR/home/.ssh/blip_ed2
   printf 'restrict,command="%s %s" ' "$PYTHON" "$ROOT/scripts/blackhole-dispatch"
   cat "$WORKDIR/home/.ssh/blip_ed25519.pub"
 } > "$WORKDIR/sshd/authorized_keys"
-chmod 600 "$WORKDIR/sshd/authorized_keys"
+# sshd drops to the user before reading this file.
+chmod 644 "$WORKDIR/sshd/authorized_keys"
 
 HOST_KEY="$WORKDIR/sshd/ssh_host_ed25519_key"
 ssh-keygen -t ed25519 -N "" -f "$HOST_KEY" -q
@@ -117,10 +122,11 @@ AuthorizedKeysFile $WORKDIR/sshd/authorized_keys
 PubkeyAuthentication yes
 PasswordAuthentication no
 KbdInteractiveAuthentication no
-UsePAM no
+UsePAM yes
 PermitRootLogin no
 StrictModes no
 UseDNS no
+AuthenticationMethods publickey
 AllowUsers $USER_NAME
 EOF
 
@@ -135,14 +141,48 @@ ip netns exec "$NETNS" ip addr add "$MAC_IP/24" dev "$VETH_MAC"
 ip netns exec "$NETNS" ip link set "$VETH_MAC" up
 ip netns exec "$NETNS" ip link set lo up
 
-ip netns exec "$NETNS" /usr/sbin/sshd -f "$WORKDIR/sshd/sshd_config" -E "$WORKDIR/sshd/sshd.log"
-SSHD_PID="$(cat "$WORKDIR/sshd/sshd.pid")"
+if ! ip netns exec "$NETNS" /usr/sbin/sshd -f "$WORKDIR/sshd/sshd_config" -E "$WORKDIR/sshd/sshd.log"; then
+  echo "sshd failed to start:" >&2
+  cat "$WORKDIR/sshd/sshd.log" >&2
+  exit 1
+fi
+# PidFile under /tmp is sometimes refused; the process is the source of truth.
+SSHD_PID=""
+for _ in $(seq 1 20); do
+  if [[ -f "$WORKDIR/sshd/sshd.pid" ]]; then
+    SSHD_PID="$(cat "$WORKDIR/sshd/sshd.pid")"
+    break
+  fi
+  SSHD_PID="$(pgrep -f "sshd -f $WORKDIR/sshd/sshd_config" | head -n1 || true)"
+  if [[ -n "$SSHD_PID" ]]; then
+    break
+  fi
+  sleep 0.1
+done
+if [[ -z "$SSHD_PID" ]]; then
+  echo "sshd started but we never found the process:" >&2
+  cat "$WORKDIR/sshd/sshd.log" >&2
+  exit 1
+fi
 
 {
   printf '%s ' "$MAC_IP"
   awk '{print $1, $2}' "$HOST_KEY.pub"
 } > "$WORKDIR/home/.ssh/known_hosts"
 chmod 600 "$WORKDIR/home/.ssh/known_hosts"
+# OpenSSH expands ~/.ssh/known_hosts from passwd, not $HOME. A PATH wrapper
+# keeps BatchMode happy without writing the operator's real known_hosts.
+# The real bridged/shim do not pass UserKnownHostsFile; a real Mac is already
+# in that file after setup.
+cat > "$WORKDIR/bin/ssh" <<EOF
+#!/bin/sh
+exec /usr/bin/ssh -F /dev/null \\
+  -o UserKnownHostsFile=$WORKDIR/home/.ssh/known_hosts \\
+  -o GlobalKnownHostsFile=/dev/null \\
+  -o StrictHostKeyChecking=yes \\
+  "\$@"
+EOF
+chmod 755 "$WORKDIR/bin/ssh"
 
 # bridge.conf — key is readable, so blip-bridged takes the dedicated-key
 # path (bare `imsg serve`, its own ControlMaster socket).
@@ -153,7 +193,7 @@ remote_bin=\$HOME/.blip/bin
 python=python3
 EOF
 
-chown -R "$USER_UID:$USER_GID" "$WORKDIR"
+chown -R "$USER_UID:$USER_GID" "$WORKDIR/home" "$WORKDIR/run"
 
 # iptables chain, empty until an outage. Helpers are root-owned so the
 # unprivileged poller can flip the blackhole without a shell function.
@@ -174,18 +214,34 @@ EOF
 chmod 755 "$WORKDIR/bh-on" "$WORKDIR/bh-off"
 
 # --- daemon ---------------------------------------------------------------
-export HOME="$WORKDIR/home"
-export XDG_RUNTIME_DIR="$WORKDIR/run"
-export BLIP_BRIDGE_CONF="$WORKDIR/home/.config/blip/bridge.conf"
+# `env KEY=val` not `--preserve-env`: sudoers env_reset drops HOME and the
+# isolated known_hosts would never be seen (BatchMode then fails host key).
+as_user() {
+  sudo -u "$USER_NAME" env \
+    HOME="$WORKDIR/home" \
+    PATH="$WORKDIR/bin:/usr/bin:/bin" \
+    XDG_RUNTIME_DIR="$WORKDIR/run" \
+    BLIP_BRIDGE_CONF="$WORKDIR/home/.config/blip/bridge.conf" \
+    BH_WORKDIR="$WORKDIR" \
+    BH_MAC_IP="$MAC_IP" \
+    BH_SSH_PORT="$SSH_PORT" \
+    BH_USER="$USER_NAME" \
+    BH_SOCK="$WORKDIR/run/blip/bridge.sock" \
+    BH_KEY="$WORKDIR/home/.ssh/blip_ed25519" \
+    BH_SHORT="$SHORT_SECS" \
+    BH_LONG="$LONG_SECS" \
+    BH_ROOT="$ROOT" \
+    BH_PYTHON="$PYTHON" \
+    "$@"
+}
 
 start_daemon() {
-  sudo -u "$USER_NAME" --preserve-env=HOME,XDG_RUNTIME_DIR,BLIP_BRIDGE_CONF \
-    "$PYTHON" "$ROOT/bridge/linux/blip-bridged" \
+  as_user "$PYTHON" "$ROOT/bridge/linux/blip-bridged" \
     >"$WORKDIR/bridged.log" 2>&1 &
   DAEMON_PID=$!
   local i
   for i in $(seq 1 50); do
-    if [[ -S "$XDG_RUNTIME_DIR/blip/bridge.sock" ]]; then
+    if [[ -S "$WORKDIR/run/blip/bridge.sock" ]]; then
       return 0
     fi
     if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
@@ -201,11 +257,13 @@ start_daemon() {
 }
 
 # Prove the stub answers before we involve the daemon.
-if ! sudo -u "$USER_NAME" --preserve-env=HOME \
-     ssh -o BatchMode=yes -o ConnectTimeout=5 \
+if ! as_user ssh -o BatchMode=yes -o ConnectTimeout=5 \
+     -i "$WORKDIR/home/.ssh/blip_ed25519" \
+     -o IdentitiesOnly=yes \
      "$USER_NAME@$MAC_IP" "imsg --json recent 1" >/dev/null; then
   echo "preflight ssh to the stub failed:" >&2
   cat "$WORKDIR/sshd/sshd.log" >&2
+  echo "known_hosts: $(cat "$WORKDIR/home/.ssh/known_hosts")" >&2
   exit 1
 fi
 
@@ -216,27 +274,19 @@ chown "$USER_UID:$USER_GID" "$WORKDIR/daemon.pid"
 cat > "$WORKDIR/bh-restart-daemon" <<EOF
 #!/bin/sh
 set -eu
-# called as root so it can sudo -u
 kill \$(cat "$WORKDIR/daemon.pid") 2>/dev/null || true
 sleep 0.2
-sudo -u "$USER_NAME" --preserve-env=HOME,XDG_RUNTIME_DIR,BLIP_BRIDGE_CONF \\
+sudo -u "$USER_NAME" env \\
+  HOME="$WORKDIR/home" \\
+  PATH="$WORKDIR/bin:/usr/bin:/bin" \\
+  XDG_RUNTIME_DIR="$WORKDIR/run" \\
+  BLIP_BRIDGE_CONF="$WORKDIR/home/.config/blip/bridge.conf" \\
   "$PYTHON" "$ROOT/bridge/linux/blip-bridged" \\
   >>"$WORKDIR/bridged.log" 2>&1 &
 echo \$! > "$WORKDIR/daemon.pid"
+chown $USER_UID:$USER_GID "$WORKDIR/daemon.pid"
 EOF
 chmod 755 "$WORKDIR/bh-restart-daemon"
 
-export BH_WORKDIR="$WORKDIR"
-export BH_MAC_IP="$MAC_IP"
-export BH_SSH_PORT="$SSH_PORT"
-export BH_USER="$USER_NAME"
-export BH_SOCK="$XDG_RUNTIME_DIR/blip/bridge.sock"
-export BH_KEY="$WORKDIR/home/.ssh/blip_ed25519"
-export BH_SHORT="$SHORT_SECS"
-export BH_LONG="$LONG_SECS"
-export BH_ROOT="$ROOT"
-export BH_PYTHON="$PYTHON"
-
 # The poller is unprivileged, same uid as the daemon and the ssh client.
-sudo -u "$USER_NAME" --preserve-env=HOME,XDG_RUNTIME_DIR,BLIP_BRIDGE_CONF,BH_WORKDIR,BH_MAC_IP,BH_SSH_PORT,BH_USER,BH_SOCK,BH_KEY,BH_SHORT,BH_LONG,BH_ROOT,BH_PYTHON \
-  "$PYTHON" "$ROOT/scripts/blackhole-channel.py"
+as_user "$PYTHON" "$ROOT/scripts/blackhole-channel.py"

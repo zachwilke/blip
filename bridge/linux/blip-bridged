@@ -48,8 +48,11 @@ was meant to help slower.
 
 Everything that touches the network has a deadline: the spawn handshake, the
 request write and the complete reply. A silent half-open peer costs at most
-one deadline, after which that ssh child is killed and reaped and its slot is
-free again; ssh's ServerAlive probes catch a dead link on the idle channel.
+one deadline, after which that ssh child is killed and reaped and its
+ControlMaster is released (`ssh -O exit`, then the socket unlinked) so the
+one-shot fallback is a new TCP SYN — ConnectTimeout does not apply to a
+client that attaches to a blackholed mux. ssh's ServerAlive probes catch a
+dead link on the idle channel.
 At most MAX_QUEUED clients wait for a slot; the rest are told to fall back at
 once instead of queueing behind a stall.
 
@@ -61,6 +64,7 @@ exit freely when idle.
 from __future__ import annotations
 
 import errno
+import glob
 import json
 import os
 import re
@@ -281,6 +285,49 @@ def _connection(conf: dict) -> tuple:
             os.access(conf["key"], os.R_OK))
 
 
+def dedicated_control_path(conf: dict) -> str | None:
+    """The dedicated key's mux socket. None when the general key is in use —
+    that path must not touch the operator's ControlMaster."""
+    if not os.access(conf.get("key") or "", os.R_OK):
+        return None
+    return f"{os.path.expanduser('~')}/.ssh/cm-blip-%r@%h:%p"
+
+
+def mux_sockets(host: str, ssh_dir: str | None = None) -> list[str]:
+    """Expanded cm-blip-* sockets for `host` (`user@name`). Tokens in
+    ControlPath become the real filename; we glob the port suffix."""
+    user, sep, name = host.rpartition("@")
+    if not sep or not user or not name:
+        return []
+    base = ssh_dir or os.path.join(os.path.expanduser("~"), ".ssh")
+    return glob.glob(os.path.join(base, f"cm-blip-{user}@{name}:*"))
+
+
+def release_mux(host: str, key: str, path: str,
+                run=subprocess.run, sockets: list[str] | None = None) -> None:
+    """Drop the ControlMaster so a one-shot fallback is a new TCP SYN.
+
+    ConnectTimeout only covers a fresh connect. A client that attaches to
+    a blackholed mux ignores it and waits until the collector's hammer
+    (15 s) — Fred's clean-kill test never saw this; a DROP does. `ssh -O
+    exit` is a local unix-socket message, capped at 1 s so a wedged master
+    cannot pin kill(). If the socket remains, unlink it: the next ssh
+    starts a new master and ConnectTimeout applies again.
+    """
+    try:
+        run(["ssh", "-i", key, "-o", "IdentitiesOnly=yes",
+             "-o", f"ControlPath={path}", "-o", "BatchMode=yes",
+             "-O", "exit", "--", host],
+            timeout=1, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+    for sock in (sockets if sockets is not None else mux_sockets(host)):
+        try:
+            os.unlink(sock)
+        except OSError:
+            pass
+
+
 def ssh_command(conf: dict) -> list[str]:
     validate_conf(conf)
     if os.access(conf["key"], os.R_OK):
@@ -290,7 +337,7 @@ def ssh_command(conf: dict) -> list[str]:
         # silently bypass the forced command.
         ssh = ["ssh", "-i", conf["key"], "-o", "IdentitiesOnly=yes",
                "-o", "ControlMaster=auto",
-               "-o", f"ControlPath={os.path.expanduser('~')}/.ssh/cm-blip-%r@%h:%p",
+               "-o", f"ControlPath={dedicated_control_path(conf)}",
                "-o", "ControlPersist=10m"]
         remote = "imsg serve"
     else:
@@ -380,26 +427,34 @@ class Channel:
 
     def kill(self) -> None:
         """Kill AND reap the ssh child, so a stalled channel leaves nothing
-        behind but a free slot."""
+        behind but a free slot. ControlPersist can leave the mux master
+        running after SIGKILL; release that too, or the one-shot fallback
+        attaches to a blackholed master and ConnectTimeout never fires."""
+        spawned = self.spawned_with
         proc, self.proc = self.proc, None
         self.spawned_with = None
         self.buf.clear()
-        if proc is None:
-            return
-        try:
-            proc.kill()
-        except OSError:
-            pass
-        try:
-            proc.wait(timeout=2)
-        except Exception:
-            pass
-        for f in (proc.stdin, proc.stdout):
+        if proc is not None:
             try:
-                if f is not None:
-                    f.close()
+                proc.kill()
             except OSError:
                 pass
+            try:
+                proc.wait(timeout=2)
+            except Exception:
+                pass
+            for f in (proc.stdin, proc.stdout):
+                try:
+                    if f is not None:
+                        f.close()
+                except OSError:
+                    pass
+        # spawned_with[4] is "the dedicated key was readable" — same
+        # condition ssh_command uses before it opens a cm-blip-* socket.
+        if spawned and spawned[4]:
+            host, key = spawned[0], spawned[1]
+            path = f"{os.path.expanduser('~')}/.ssh/cm-blip-%r@%h:%p"
+            release_mux(host, key, path)
 
     def request(self, payload: bytes, conf: dict, deadline: float) -> bytes:
         """Send one request line, return the framed reply (header + body).

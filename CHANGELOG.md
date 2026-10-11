@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **A silent Wi-Fi loss no longer hangs the one-shot fallback.** Killing the
+  serve ssh (clean EOF/RST) already fell back; a blackhole does not — TCP
+  stays up, ControlMaster clients ignore `ConnectTimeout`, and a poll waited
+  the collector's 15 s hammer on top of the 12 s deadline. The daemon now
+  releases the mux when it kills a channel (`ssh -O exit`, then unlink), and
+  the shim carries the same ServerAliveInterval=10/CountMax=2 the serve
+  channel already had. `scripts/blackhole-channel` reproduces the DROP.
+
 - **A send waits for the Automation prompt (#131, David Benedic).** `imsg-send`
   waited only 15 seconds for Messages, shorter than the Automation Allow
   prompt, so a first send died before anyone could click. It now waits 150
