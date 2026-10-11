@@ -1,0 +1,42 @@
+#!/usr/bin/env python3
+"""Stand-in for `imsg` / `imsg serve` on a Linux host.
+
+Speaks the real serve framing (`ready`, then {"status","len"} + N bytes) and
+a one-shot `--json recent` reply. No chat.db, no Contacts, no message text
+from a real conversation — the body is a single placeholder row. Used by
+scripts/blackhole-channel to play the Mac's side of the warm channel.
+"""
+from __future__ import annotations
+
+import json
+import sys
+
+# Placeholder only. Never a real conversation.
+BODY = (
+    b'[{"chat":"+15551234567","is_from_me":1,'
+    b'"text":"ping","date":"2026-01-01T00:00:00Z"}]\n'
+)
+
+
+def serve() -> None:
+    out = sys.stdout.buffer
+    out.write(b"ready\n")
+    out.flush()
+    for line in sys.stdin:
+        if not line.strip():
+            continue
+        out.write(json.dumps({"status": 0, "len": len(BODY)}).encode() + b"\n")
+        out.write(BODY)
+        out.flush()
+
+
+def oneshot() -> None:
+    sys.stdout.buffer.write(BODY)
+    sys.stdout.buffer.flush()
+
+
+if __name__ == "__main__":
+    if "serve" in sys.argv:
+        serve()
+    else:
+        oneshot()

@@ -1,0 +1,242 @@
+#!/usr/bin/env bash
+# blackhole-channel — silent-loss harness for the warm Mac channel.
+#
+# WHAT THIS IS
+#   Fred's #83 test killed the channel's ssh links (clean EOF/RST). Real
+#   Wi-Fi loss is usually a blackhole: packets vanish and TCP stays up.
+#   This script stands both ends up on Linux, DROPs the peer, and measures
+#   whether polls fall back or hang.
+#
+# WHAT IS SIMULATED
+#   - The Mac is a network namespace with sshd and scripts/blackhole-imsg
+#     (serve framing + one-shot recent). No chat.db, no Messages, no TCC.
+#   - The Linux side is the real blip-bridged plus the same ssh the shim
+#     would run for one-shot fallback.
+#   - The outage is iptables DROP on the veth, not `kill`, not RST.
+#   - BarWidget's 30 s restart timer is modelled: if the daemon exits we
+#     record it and start it again after 30 s, the same way the bar does.
+#
+# WHAT IS NOT
+#   - A real Mac, a real Wi-Fi radio, NAT, or middleboxes.
+#   - The collector.ts / socat client (this talks the unix socket directly).
+#     Timeouts match collector (15 s) and the daemon (12 s request deadline).
+#
+# A macOS GitHub runner cannot do this: no network namespaces, no iptables.
+# pfctl/dnctl could blackhole a loopback sshd there, but this harness is
+# Linux-only on purpose — do not add it to CI.
+#
+# Usage (needs sudo for netns + iptables):
+#   sudo -E scripts/blackhole-channel
+#   sudo -E scripts/blackhole-channel --short     # 5 s + 20 s outages
+#   sudo -E scripts/blackhole-channel --long-only
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SHORT=0
+LONG_ONLY=0
+for a in "$@"; do
+  case "$a" in
+    --short) SHORT=1 ;;
+    --long-only) LONG_ONLY=1 ;;
+    -h|--help) sed -n '2,36p' "$0"; exit 0 ;;
+    *) echo "unknown flag: $a" >&2; exit 64 ;;
+  esac
+done
+
+if [[ "$(id -u)" -ne 0 ]]; then
+  echo "blackhole-channel: need root for network namespaces and iptables DROP" >&2
+  exit 77
+fi
+
+# Isolated identities — nothing from the operator's real ssh/config/home.
+# 10.67.83.0/24 is this harness only (83 = the upstream PR).
+NETNS=blip-bh
+VETH_HOST=veth-bh0
+VETH_MAC=veth-bh1
+HOST_IP=10.67.83.1
+MAC_IP=10.67.83.2
+# Port 22 in the namespace, like a real Mac. Host sshd on 0.0.0.0:22 does
+# not see these packets — they go out the veth — so we do not need a
+# custom Port in ssh_config (the real bridged/shim never pass one).
+SSH_PORT=22
+CHAIN=BLIP_BH
+WORKDIR="${TMPDIR:-/tmp}/blip-blackhole-$$"
+USER_NAME="${SUDO_USER:-$(id -un)}"
+if [[ "$USER_NAME" == "root" ]]; then
+  USER_NAME="$(logname 2>/dev/null || id -un)"
+fi
+USER_UID="$(id -u "$USER_NAME")"
+USER_GID="$(id -g "$USER_NAME")"
+PYTHON="${PYTHON:-python3}"
+SHORT_SECS=5
+LONG_SECS=60
+if (( SHORT )); then LONG_SECS=20; fi
+if (( LONG_ONLY )); then SHORT_SECS=0; fi
+
+cleanup() {
+  set +e
+  if [[ -n "${DAEMON_PID:-}" ]]; then
+    kill "$DAEMON_PID" 2>/dev/null
+    wait "$DAEMON_PID" 2>/dev/null
+  fi
+  if [[ -n "${SSHD_PID:-}" ]]; then
+    kill "$SSHD_PID" 2>/dev/null
+    wait "$SSHD_PID" 2>/dev/null
+  fi
+  iptables -D OUTPUT -j "$CHAIN" 2>/dev/null
+  iptables -D INPUT -j "$CHAIN" 2>/dev/null
+  iptables -F "$CHAIN" 2>/dev/null
+  iptables -X "$CHAIN" 2>/dev/null
+  ip netns del "$NETNS" 2>/dev/null
+  ip link del "$VETH_HOST" 2>/dev/null
+  rm -rf "$WORKDIR"
+}
+trap cleanup EXIT
+
+mkdir -p "$WORKDIR"/{home/.ssh,home/.config/blip,run/blip,sshd}
+chmod 700 "$WORKDIR" "$WORKDIR/home" "$WORKDIR/home/.ssh" "$WORKDIR/run" "$WORKDIR/run/blip"
+
+# --- ssh identities -------------------------------------------------------
+sudo -u "$USER_NAME" ssh-keygen -t ed25519 -N "" -f "$WORKDIR/home/.ssh/blip_ed25519" -q
+{
+  printf 'restrict,command="%s %s" ' "$PYTHON" "$ROOT/scripts/blackhole-dispatch"
+  cat "$WORKDIR/home/.ssh/blip_ed25519.pub"
+} > "$WORKDIR/sshd/authorized_keys"
+chmod 600 "$WORKDIR/sshd/authorized_keys"
+
+HOST_KEY="$WORKDIR/sshd/ssh_host_ed25519_key"
+ssh-keygen -t ed25519 -N "" -f "$HOST_KEY" -q
+mkdir -p /run/sshd
+chmod 755 /run/sshd
+cat > "$WORKDIR/sshd/sshd_config" <<EOF
+Port $SSH_PORT
+ListenAddress $MAC_IP
+HostKey $HOST_KEY
+PidFile $WORKDIR/sshd/sshd.pid
+AuthorizedKeysFile $WORKDIR/sshd/authorized_keys
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+UsePAM no
+PermitRootLogin no
+StrictModes no
+UseDNS no
+AllowUsers $USER_NAME
+EOF
+
+# --- namespace + sshd -----------------------------------------------------
+ip netns del "$NETNS" 2>/dev/null || true
+ip netns add "$NETNS"
+ip link add "$VETH_HOST" type veth peer name "$VETH_MAC"
+ip link set "$VETH_MAC" netns "$NETNS"
+ip addr add "$HOST_IP/24" dev "$VETH_HOST"
+ip link set "$VETH_HOST" up
+ip netns exec "$NETNS" ip addr add "$MAC_IP/24" dev "$VETH_MAC"
+ip netns exec "$NETNS" ip link set "$VETH_MAC" up
+ip netns exec "$NETNS" ip link set lo up
+
+ip netns exec "$NETNS" /usr/sbin/sshd -f "$WORKDIR/sshd/sshd_config" -E "$WORKDIR/sshd/sshd.log"
+SSHD_PID="$(cat "$WORKDIR/sshd/sshd.pid")"
+
+{
+  printf '%s ' "$MAC_IP"
+  awk '{print $1, $2}' "$HOST_KEY.pub"
+} > "$WORKDIR/home/.ssh/known_hosts"
+chmod 600 "$WORKDIR/home/.ssh/known_hosts"
+
+# bridge.conf — key is readable, so blip-bridged takes the dedicated-key
+# path (bare `imsg serve`, its own ControlMaster socket).
+cat > "$WORKDIR/home/.config/blip/bridge.conf" <<EOF
+host=$USER_NAME@$MAC_IP
+key=$WORKDIR/home/.ssh/blip_ed25519
+remote_bin=\$HOME/.blip/bin
+python=python3
+EOF
+
+chown -R "$USER_UID:$USER_GID" "$WORKDIR"
+
+# iptables chain, empty until an outage. Helpers are root-owned so the
+# unprivileged poller can flip the blackhole without a shell function.
+iptables -N "$CHAIN" 2>/dev/null || iptables -F "$CHAIN"
+iptables -C OUTPUT -j "$CHAIN" 2>/dev/null || iptables -I OUTPUT -j "$CHAIN"
+iptables -C INPUT -j "$CHAIN" 2>/dev/null || iptables -I INPUT -j "$CHAIN"
+
+cat > "$WORKDIR/bh-on" <<EOF
+#!/bin/sh
+iptables -F $CHAIN
+iptables -A $CHAIN -p tcp -d $MAC_IP --dport $SSH_PORT -j DROP
+iptables -A $CHAIN -p tcp -s $MAC_IP --sport $SSH_PORT -j DROP
+EOF
+cat > "$WORKDIR/bh-off" <<EOF
+#!/bin/sh
+iptables -F $CHAIN
+EOF
+chmod 755 "$WORKDIR/bh-on" "$WORKDIR/bh-off"
+
+# --- daemon ---------------------------------------------------------------
+export HOME="$WORKDIR/home"
+export XDG_RUNTIME_DIR="$WORKDIR/run"
+export BLIP_BRIDGE_CONF="$WORKDIR/home/.config/blip/bridge.conf"
+
+start_daemon() {
+  sudo -u "$USER_NAME" --preserve-env=HOME,XDG_RUNTIME_DIR,BLIP_BRIDGE_CONF \
+    "$PYTHON" "$ROOT/bridge/linux/blip-bridged" \
+    >"$WORKDIR/bridged.log" 2>&1 &
+  DAEMON_PID=$!
+  local i
+  for i in $(seq 1 50); do
+    if [[ -S "$XDG_RUNTIME_DIR/blip/bridge.sock" ]]; then
+      return 0
+    fi
+    if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
+      echo "blip-bridged exited before the socket appeared:" >&2
+      cat "$WORKDIR/bridged.log" >&2
+      return 1
+    fi
+    sleep 0.1
+  done
+  echo "blip-bridged never created the socket" >&2
+  cat "$WORKDIR/bridged.log" >&2
+  return 1
+}
+
+# Prove the stub answers before we involve the daemon.
+if ! sudo -u "$USER_NAME" --preserve-env=HOME \
+     ssh -o BatchMode=yes -o ConnectTimeout=5 \
+     "$USER_NAME@$MAC_IP" "imsg --json recent 1" >/dev/null; then
+  echo "preflight ssh to the stub failed:" >&2
+  cat "$WORKDIR/sshd/sshd.log" >&2
+  exit 1
+fi
+
+start_daemon
+echo "$DAEMON_PID" > "$WORKDIR/daemon.pid"
+chown "$USER_UID:$USER_GID" "$WORKDIR/daemon.pid"
+# The poller restarts us the way the bar does (30 s after exit).
+cat > "$WORKDIR/bh-restart-daemon" <<EOF
+#!/bin/sh
+set -eu
+# called as root so it can sudo -u
+kill \$(cat "$WORKDIR/daemon.pid") 2>/dev/null || true
+sleep 0.2
+sudo -u "$USER_NAME" --preserve-env=HOME,XDG_RUNTIME_DIR,BLIP_BRIDGE_CONF \\
+  "$PYTHON" "$ROOT/bridge/linux/blip-bridged" \\
+  >>"$WORKDIR/bridged.log" 2>&1 &
+echo \$! > "$WORKDIR/daemon.pid"
+EOF
+chmod 755 "$WORKDIR/bh-restart-daemon"
+
+export BH_WORKDIR="$WORKDIR"
+export BH_MAC_IP="$MAC_IP"
+export BH_SSH_PORT="$SSH_PORT"
+export BH_USER="$USER_NAME"
+export BH_SOCK="$XDG_RUNTIME_DIR/blip/bridge.sock"
+export BH_KEY="$WORKDIR/home/.ssh/blip_ed25519"
+export BH_SHORT="$SHORT_SECS"
+export BH_LONG="$LONG_SECS"
+export BH_ROOT="$ROOT"
+export BH_PYTHON="$PYTHON"
+
+# The poller is unprivileged, same uid as the daemon and the ssh client.
+sudo -u "$USER_NAME" --preserve-env=HOME,XDG_RUNTIME_DIR,BLIP_BRIDGE_CONF,BH_WORKDIR,BH_MAC_IP,BH_SSH_PORT,BH_USER,BH_SOCK,BH_KEY,BH_SHORT,BH_LONG,BH_ROOT,BH_PYTHON \
+  "$PYTHON" "$ROOT/scripts/blackhole-channel.py"

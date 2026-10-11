@@ -1,0 +1,29 @@
+#!/usr/bin/env python3
+"""Stand-in for blip-dispatch on a Linux host.
+
+The dedicated key's authorized_keys `command=` lands here. SSH_ORIGINAL_COMMAND
+is `imsg serve` or `imsg --json recent N` — the same bare tool names the real
+dispatch allows. Exec the stub; never a shell interpolation of the original
+command.
+"""
+from __future__ import annotations
+
+import os
+import shlex
+import sys
+from pathlib import Path
+
+STUB = Path(__file__).resolve().parent / "blackhole-imsg"
+
+
+def main() -> None:
+    raw = os.environ.get("SSH_ORIGINAL_COMMAND") or ""
+    parts = shlex.split(raw)
+    if not parts or parts[0] != "imsg":
+        sys.stderr.write("blackhole-dispatch: only imsg is allowed\n")
+        sys.exit(64)
+    os.execv(sys.executable, [sys.executable, str(STUB), *parts[1:]])
+
+
+if __name__ == "__main__":
+    main()

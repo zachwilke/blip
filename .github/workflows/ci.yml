@@ -64,10 +64,12 @@ jobs:
         run: python3 bridge/linux/test_bridged_conf.py
       - name: blip-bridged socket trust, deadlines, filter parity (mocked ssh, no network)
         run: python3 bridge/linux/test_bridged.py
+      - name: silent-loss harness pieces compile (no root, no network)
+        run: python3 -m py_compile scripts/blackhole-channel.py scripts/blackhole-imsg scripts/blackhole-dispatch
       - name: send waits for the Automation prompt (no macOS needed)
         run: python3 bridge/mac/test_imsg_send_wait.py
       - name: shell scripts (bash -n + shellcheck)
         run: |
-          bash -n bridge/linux/blip-shim scripts/blip-setup scripts/sync-bridge.sh scripts/demo/blip-shots bridge/mac/install.sh
+          bash -n bridge/linux/blip-shim scripts/blip-setup scripts/sync-bridge.sh scripts/demo/blip-shots bridge/mac/install.sh scripts/blackhole-channel
           sudo apt-get install -y -q shellcheck >/dev/null
           shellcheck -S warning bridge/linux/blip-shim scripts/blip-setup scripts/sync-bridge.sh bridge/mac/install.sh
