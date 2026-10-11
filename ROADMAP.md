@@ -47,7 +47,10 @@ changes to the Mac beyond claude-on-mac updates.
   `/attach <path>`, drag-and-drop; draft chip with ✕; caption rides along,
   reported per-part. Verified delivered from the Linux box end-to-end.
 - [x] **Audio messages (inbound)** — verified 1.3.0: the 🎤 chip fetches and
-  xdg-opens into mpv (the Linux box's audio/x-m4a handler). Nothing more needed.
+  plays through mpv with no window (2026-09-26: xdg-open gave mpv an empty
+  black video window); a second click stops it. iPhone voice messages are CAF
+  with no MIME in chat.db: the bridge fills it from the UTI and fetch.ts
+  re-encodes to Ogg Opus.
 
 ## Tier 3 — UX parity
 
@@ -176,18 +179,45 @@ panel (3 lenses × finding, against current main) confirmed 11 closed and
 - [x] One BarWidget per monitor → leader election (2.2.0; follower bars
   show the badge from state.json and forward clicks over IPC).
 - [x] SMS/RCS threads send on their own service (2.2.0).
-- [ ] **3–4 digit short codes classify as groups** — `isGroupChat()` treats a
-  digits-only id shorter than 5 as "not a phone", so a carrier-style sender
-  opens read-only with "group id unknown". Widen to `{3,15}` (E.164 max is
-  15) once tested against a real one. 5+ digit codes load correctly since 2.2.1.
-- [ ] **Timestamps are Mac-local wall-clock strings** compared against the
-  Linux clock (DST fall-back hour, a UTC Mac). Move the bridge to epoch/UTC
-  and convert on display. Cross-cutting; do it as its own release.
-- [ ] **One never-opened unread pins the catch-up loop** — every poll walks
-  150→8192 rows across sequential ssh calls. Cache the reconciliation
-  boundary per chat.
+- [ ] **Sending tapbacks may be possible after all** (2026-09-07). The
+  "needs SIP-off injection" verdict predates macOS 26: Messages now has
+  `Edit ▸ Tapback Message…` as a real menu item (also `Reply to Message…`
+  and `Edit Last Message…`), enumerated over System Events. That is the same
+  shape `imsg-read` used to overturn "marking read is impossible". Unproven:
+  the items read `enabled=false` from the background, which proves nothing
+  (responder-chain validation — test with Messages frontmost); the item acts
+  on the SELECTED message and selecting an arbitrary bubble from Linux is the
+  open problem; the picker needs navigating for the emoji; and it steals
+  focus. Groups remain unaddressable. #69 is discussing a working
+  Accessibility-on-balloons approach (SIP on); nothing from that issue is
+  in-tree yet.
+
+- [x] **3–4 digit short codes classify as groups** — widened to `{3,15}`
+  (E.164 max is 15), tested against a real one (`2536`, T-Mobile). The rule
+  lived in four places — `isGroupChat()`, `sendServiceForMessages()` and two
+  hand-written mirrors in `BlipView.qml` — so all four moved together and a
+  test now pins them to one bound. Beyond 15 digits an id is a group again,
+  which keeps "an unknown shape is never a DM target" true.
+- [x] **Timestamps are Mac-local wall-clock strings** compared against the
+  Linux clock (DST fall-back hour, a UTC Mac) — fixed: the bridge emits
+  ISO-8601 UTC (`fmt_ts`), `fmt_ts_local` keeps the human CLI renders on the
+  Mac's clock, and every label is converted to the reader's zone at display
+  (`localDay`/`formatStamp` in thread.ts, `fmtTime` in BlipView). Stamps are
+  normalised at the two fetch doors, so a Mac on the old bridge still works;
+  `state.json` marks migrate on load. Covered by `timezone.test.ts` and
+  `bridge/mac/test_wire_time.py` (both pin a zone; the rest of the suite runs
+  at UTC, where the bug is invisible).
+- [x] **One never-opened unread pinned the catch-up loop** — fixed: the window
+  fetch stops at the watermark, and each outstanding unread is reconciled
+  against its OWN boundary with one bounded `thread --chat` fetch that
+  escalates alone (`windowCutoff`, `staleUnreadChats`, `fetchChatBack`). A
+  chat the fetch cannot reach keeps the count it had rather than reporting an
+  undercount. Measured with a 45-day-old dot, one poll: 6 bridge calls /
+  4798 rows / 3.2 s → 2-3 calls / 250-950 rows / 0.9 s, same unread count.
 - [x] Window marks read only while focused (2.2.0, Hyprland active toplevel).
-- [ ] Toasts fire for the conversation being read (bar popout case).
+- [x] Toasts fire for the conversation being read — `selectToasts()` never
+  saw `readChat`, so BOTH surfaces toasted, not just the bar popout. It is
+  now a fourth gate, alias-aware like the read marks beside it.
 - [x] Self-chat promotion needs two twins to persist (2.2.0).
 - [x] Failure toasts re-fired (ring normalizer dropped the `fail:` prefix) (2.2.0).
 - [x] `country_code=` in bridge.conf for non-NANP numbers (2.2.0).
@@ -219,6 +249,41 @@ panel (3 lenses × finding, against current main) confirmed 11 closed and
   the phone** and push-latency delivery. Its Quickshell client is worth
   reading; a future hybrid could borrow BT MAP *just* for read-marking.
   Check its license before lifting code.
+
+  **Re-examined 2026-09-09, and the license question is now answered: NO code
+  can be lifted.** The backend is GPL-2.0-or-later, the Omarchy widget
+  (`erikwb/omarchy-blueferry`, a UI shell with no backend in it) is
+  GPL-2.0-only. Blip is MIT. Copying either relicenses Blip. What can cross is
+  knowledge: their `PROTOCOL.md` records observed iPhone behaviour, and facts
+  about how a device responds belong to nobody. An independent implementation
+  from those findings plus BlueZ's public API is clean; reworking their code is
+  not.
+
+  Mechanism, read from their source rather than their README: sending is
+  `MessageAccess1.PushMessage` with a bMessage payload over BlueZ's OBEX D-Bus
+  API; read-marking sets the `Read` property on an `org.bluez.obex.Message1`
+  object; PBAP carries contacts; ANCS over BLE mirrors other notifications on a
+  second bearer. iOS only grants messaging permission to an adapter presenting
+  as a hands-free car kit (Class of Device major 4, minor 8), and the pairing
+  order decides whether one bond covers both transports.
+
+  **The prize is group read-marking.** Via the Mac it is impossible (see
+  CLAUDE.md: a group's `chat<digits>` id has no `imessage://` form), and the
+  DM path that does work has to open the conversation in Messages, which pulls
+  it to the front of the Mac. MAP needs no Mac and steals no focus. Untested:
+  it would only reach messages a live MAP session has seen, and handles go
+  stale across reconnects, so it could never clear historical stragglers.
+
+  **Tried 2026-09-09, blocked on hardware.** Software side is ready:
+  `bluez-obex` installed, `obexd` carries `MessageAccess1`, BlueZ 5.87 clears
+  both floors their doc states (5.72 MAP, 5.86 dual-bearer). dex's radio is
+  not: the Realtek RTL8852CE (`0bda:886c`) sits in a reset loop the moment it
+  is unblocked — `command 0xfc61 tx timeout`, `Read reg16 failed (-110)`,
+  `Resetting usb device`, every two seconds — so it never enumerates long
+  enough to pair. Firmware is present, so this is the part or the driver, not a
+  missing blob. Bluetooth was left soft-blocked, as found. A USB dongle with a
+  chipset they have actually tested (MediaTek MT7922 or Intel) turns this back
+  into a one-evening experiment.
 
 ## Not possible (and why)
 

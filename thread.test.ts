@@ -13,14 +13,18 @@ import {
   loadThread,
   localToday,
   minutesBetween,
+  parsePendingSends,
+  pendingBubble,
   receiptLabel,
   selectThread,
+  withPendingSends,
 } from "./thread";
+import type { Bubble, PendingSend } from "./thread";
 import { cliChatArg } from "./thread";
 
 function msg(over: Partial<ImsgMessage> = {}): ImsgMessage {
   return {
-    ts: "2026-08-30 12:00:00",
+    ts: "2026-08-30T12:00:00Z",
     from_me: false,
     handle: "+15551234567",
     name: "Test Person",
@@ -34,7 +38,7 @@ function msg(over: Partial<ImsgMessage> = {}): ImsgMessage {
 const DOTTED: Formats = { time: "HH:mm", date: "dd.MM", dateWithYear: "dd.MM.yyyy" };
 
 describe("formatStamp", () => {
-  const ts = "2026-08-30 21:08:22"; // a Sunday
+  const ts = "2026-08-30T21:08:22Z"; // a Sunday
 
   test.each([
     ["HH:mm", "21:08"],
@@ -59,8 +63,8 @@ describe("formatStamp", () => {
   });
 
   test("midnight and noon on a 12-hour clock", () => {
-    expect(formatStamp("2026-08-30 00:30:00", "h:mm AP")).toBe("12:30 AM");
-    expect(formatStamp("2026-08-30 12:00:00", "h:mm AP")).toBe("12:00 PM");
+    expect(formatStamp("2026-08-30T00:30:00Z", "h:mm AP")).toBe("12:30 AM");
+    expect(formatStamp("2026-08-30T12:00:00Z", "h:mm AP")).toBe("12:00 PM");
   });
 
   test("a date-only stamp formats at midnight", () => {
@@ -88,23 +92,23 @@ describe("formatsFromArgv", () => {
 
 describe("clockLabel", () => {
   test("formats afternoon as 12-hour with PM", () => {
-    expect(clockLabel("2026-08-30 21:08:22")).toBe("9:08 PM");
+    expect(clockLabel("2026-08-30T21:08:22Z")).toBe("9:08 PM");
   });
 
   test("formats morning as AM", () => {
-    expect(clockLabel("2026-08-30 09:05:00")).toBe("9:05 AM");
+    expect(clockLabel("2026-08-30T09:05:00Z")).toBe("9:05 AM");
   });
 
   test("midnight is 12 AM, not 0 AM", () => {
-    expect(clockLabel("2026-08-30 00:30:00")).toBe("12:30 AM");
+    expect(clockLabel("2026-08-30T00:30:00Z")).toBe("12:30 AM");
   });
 
   test("noon is 12 PM, not 0 PM", () => {
-    expect(clockLabel("2026-08-30 12:00:00")).toBe("12:00 PM");
+    expect(clockLabel("2026-08-30T12:00:00Z")).toBe("12:00 PM");
   });
 
   test("follows the time pattern it is given", () => {
-    expect(clockLabel("2026-08-30 21:08:22", "HH:mm")).toBe("21:08");
+    expect(clockLabel("2026-08-30T21:08:22Z", "HH:mm")).toBe("21:08");
   });
 
   test("garbage in yields an empty label, not a crash", () => {
@@ -116,30 +120,30 @@ describe("dayLabel", () => {
   const today = "2026-08-30";
 
   test("same date reads Today", () => {
-    expect(dayLabel("2026-08-30 09:00:00", today)).toBe("Today");
+    expect(dayLabel("2026-08-30T09:00:00Z", today)).toBe("Today");
   });
 
   test("one day back reads Yesterday", () => {
-    expect(dayLabel("2026-08-29 09:00:00", today)).toBe("Yesterday");
+    expect(dayLabel("2026-08-29T09:00:00Z", today)).toBe("Yesterday");
   });
 
   test("earlier this year omits the year", () => {
-    expect(dayLabel("2026-08-28 09:00:00", today)).toBe("Aug 28");
+    expect(dayLabel("2026-08-28T09:00:00Z", today)).toBe("Aug 28");
   });
 
   test("a previous year includes it", () => {
-    expect(dayLabel("2025-12-24 09:00:00", today)).toBe("Dec 24, 2025");
+    expect(dayLabel("2025-12-24T09:00:00Z", today)).toBe("Dec 24, 2025");
   });
 
   test("dates follow the patterns, Today and Yesterday stay words", () => {
-    expect(dayLabel("2026-08-30 09:00:00", today, DOTTED)).toBe("Today");
-    expect(dayLabel("2026-08-29 09:00:00", today, DOTTED)).toBe("Yesterday");
-    expect(dayLabel("2026-08-28 09:00:00", today, DOTTED)).toBe("28.08");
-    expect(dayLabel("2025-12-24 09:00:00", today, DOTTED)).toBe("24.12.2025");
+    expect(dayLabel("2026-08-30T09:00:00Z", today, DOTTED)).toBe("Today");
+    expect(dayLabel("2026-08-29T09:00:00Z", today, DOTTED)).toBe("Yesterday");
+    expect(dayLabel("2026-08-28T09:00:00Z", today, DOTTED)).toBe("28.08");
+    expect(dayLabel("2025-12-24T09:00:00Z", today, DOTTED)).toBe("24.12.2025");
   });
 
   test("crossing a month boundary still resolves Yesterday", () => {
-    expect(dayLabel("2026-07-31 09:00:00", "2026-08-01")).toBe("Yesterday");
+    expect(dayLabel("2026-07-31T09:00:00Z", "2026-08-01")).toBe("Yesterday");
   });
 
   test("malformed input yields an empty label", () => {
@@ -149,15 +153,15 @@ describe("dayLabel", () => {
 
 describe("minutesBetween", () => {
   test("measures a simple gap", () => {
-    expect(minutesBetween("2026-08-30 12:00:00", "2026-08-30 12:20:00")).toBe(20);
+    expect(minutesBetween("2026-08-30T12:00:00Z", "2026-08-30T12:20:00Z")).toBe(20);
   });
 
   test("is order-independent", () => {
-    expect(minutesBetween("2026-08-30 12:20:00", "2026-08-30 12:00:00")).toBe(20);
+    expect(minutesBetween("2026-08-30T12:20:00Z", "2026-08-30T12:00:00Z")).toBe(20);
   });
 
   test("unparseable stamps read as infinitely far apart, forcing a new group", () => {
-    expect(minutesBetween("junk", "2026-08-30 12:00:00")).toBe(Number.POSITIVE_INFINITY);
+    expect(minutesBetween("junk", "2026-08-30T12:00:00Z")).toBe(Number.POSITIVE_INFINITY);
   });
 });
 
@@ -165,7 +169,7 @@ describe("decorate", () => {
   const today = "2026-08-30";
 
   test("a lone message is both group start and end", () => {
-    const b = decorate([msg({ ts: "2026-08-30 12:00:00" })], today);
+    const b = decorate([msg({ ts: "2026-08-30T12:00:00Z" })], today);
     expect(b[0]!.groupStart).toBe(true);
     expect(b[0]!.groupEnd).toBe(true);
     expect(b[0]!.time).toBe("12:00 PM");
@@ -173,7 +177,7 @@ describe("decorate", () => {
 
   test("the patterns reach the divider, the timestamp and the read receipt", () => {
     const b = decorate(
-      [msg({ ts: "2026-08-28 16:42:00", from_me: true, read_at: "2026-08-28 16:45:00" })],
+      [msg({ ts: "2026-08-28T16:42:00Z", from_me: true, read_at: "2026-08-28T16:45:00Z" })],
       today,
       DOTTED,
     );
@@ -185,9 +189,9 @@ describe("decorate", () => {
   test("consecutive messages from one sender form a single group", () => {
     const b = decorate(
       [
-        msg({ ts: "2026-08-30 12:00:00", text: "one" }),
-        msg({ ts: "2026-08-30 12:01:00", text: "two" }),
-        msg({ ts: "2026-08-30 12:02:00", text: "three" }),
+        msg({ ts: "2026-08-30T12:00:00Z", text: "one" }),
+        msg({ ts: "2026-08-30T12:01:00Z", text: "two" }),
+        msg({ ts: "2026-08-30T12:02:00Z", text: "three" }),
       ],
       today,
     );
@@ -197,7 +201,7 @@ describe("decorate", () => {
 
   test("only the last bubble of a group carries a timestamp", () => {
     const b = decorate(
-      [msg({ ts: "2026-08-30 12:00:00" }), msg({ ts: "2026-08-30 12:01:00" })],
+      [msg({ ts: "2026-08-30T12:00:00Z" }), msg({ ts: "2026-08-30T12:01:00Z" })],
       today,
     );
     expect(b[0]!.time).toBe("");
@@ -207,8 +211,8 @@ describe("decorate", () => {
   test("a sender change breaks the group", () => {
     const b = decorate(
       [
-        msg({ ts: "2026-08-30 12:00:00", from_me: false }),
-        msg({ ts: "2026-08-30 12:01:00", from_me: true }),
+        msg({ ts: "2026-08-30T12:00:00Z", from_me: false }),
+        msg({ ts: "2026-08-30T12:01:00Z", from_me: true }),
       ],
       today,
     );
@@ -219,8 +223,8 @@ describe("decorate", () => {
   test("in a group, a different member breaks the run even seconds apart", () => {
     const b = decorate(
       [
-        msg({ ts: "2026-08-30 12:00:00", handle: "+1111111111", name: "Jordan" }),
-        msg({ ts: "2026-08-30 12:00:30", handle: "+2222222222", name: "Casey" }),
+        msg({ ts: "2026-08-30T12:00:00Z", handle: "+1111111111", name: "Jordan" }),
+        msg({ ts: "2026-08-30T12:00:30Z", handle: "+2222222222", name: "Casey" }),
       ],
       today,
     );
@@ -230,7 +234,7 @@ describe("decorate", () => {
 
   test("a gap longer than 15 minutes breaks the group", () => {
     const b = decorate(
-      [msg({ ts: "2026-08-30 12:00:00" }), msg({ ts: "2026-08-30 12:20:00" })],
+      [msg({ ts: "2026-08-30T12:00:00Z" }), msg({ ts: "2026-08-30T12:20:00Z" })],
       today,
     );
     expect(b[1]!.groupStart).toBe(true);
@@ -238,7 +242,7 @@ describe("decorate", () => {
 
   test("a gap under 15 minutes does not", () => {
     const b = decorate(
-      [msg({ ts: "2026-08-30 12:00:00" }), msg({ ts: "2026-08-30 12:14:00" })],
+      [msg({ ts: "2026-08-30T12:00:00Z" }), msg({ ts: "2026-08-30T12:14:00Z" })],
       today,
     );
     expect(b[1]!.groupStart).toBe(false);
@@ -247,9 +251,9 @@ describe("decorate", () => {
   test("the day label appears once, on the first message of that day", () => {
     const b = decorate(
       [
-        msg({ ts: "2026-08-29 23:00:00" }),
-        msg({ ts: "2026-08-30 09:00:00" }),
-        msg({ ts: "2026-08-30 09:01:00" }),
+        msg({ ts: "2026-08-29T23:00:00Z" }),
+        msg({ ts: "2026-08-30T09:00:00Z" }),
+        msg({ ts: "2026-08-30T09:01:00Z" }),
       ],
       today,
     );
@@ -260,7 +264,7 @@ describe("decorate", () => {
 
   test("a day change always starts a new group even within 15 minutes", () => {
     const b = decorate(
-      [msg({ ts: "2026-08-29 23:59:00" }), msg({ ts: "2026-08-30 00:01:00" })],
+      [msg({ ts: "2026-08-29T23:59:00Z" }), msg({ ts: "2026-08-30T00:01:00Z" })],
       today,
     );
     expect(b[1]!.groupStart).toBe(true);
@@ -282,8 +286,8 @@ describe("dedupeSelfEcho", () => {
     // A real send logs twice: from_me=true with empty text, and from_me=false
     // carrying the text. Rendering both shows your own message as theirs.
     const out = dedupeSelfEcho([
-      msg({ ts: "2026-08-30 21:08:22", from_me: true, text: "" }),
-      msg({ ts: "2026-08-30 21:08:22", from_me: false, text: "Larry test" }),
+      msg({ ts: "2026-08-30T21:08:22Z", from_me: true, text: "" }),
+      msg({ ts: "2026-08-30T21:08:22Z", from_me: false, text: "Larry test" }),
     ]);
     expect(out).toHaveLength(1);
     expect(out[0]!.text).toBe("Larry test");
@@ -291,8 +295,8 @@ describe("dedupeSelfEcho", () => {
 
   test("the surviving twin is re-attributed to me — it renders on the right", () => {
     const out = dedupeSelfEcho([
-      msg({ ts: "2026-08-30 21:08:22", from_me: true, text: "" }),
-      msg({ ts: "2026-08-30 21:08:22", from_me: false, text: "mine" }),
+      msg({ ts: "2026-08-30T21:08:22Z", from_me: true, text: "" }),
+      msg({ ts: "2026-08-30T21:08:22Z", from_me: false, text: "mine" }),
     ]);
     expect(out[0]!.from_me).toBe(true);
   });
@@ -301,14 +305,14 @@ describe("dedupeSelfEcho", () => {
     // imsg decodes attributedBody, so the from_me=true twin has text too.
     const self = msg().chat;
     const a = dedupeSelfEcho([
-      msg({ ts: "2026-08-30 21:08:22", from_me: false, text: "same" }),
-      msg({ ts: "2026-08-30 21:08:22", from_me: true, text: "same" }),
+      msg({ ts: "2026-08-30T21:08:22Z", from_me: false, text: "same" }),
+      msg({ ts: "2026-08-30T21:08:22Z", from_me: true, text: "same" }),
     ], [self]);
     expect(a).toHaveLength(1);
     expect(a[0]!.from_me).toBe(true);
     const b = dedupeSelfEcho([
-      msg({ ts: "2026-08-30 21:08:22", from_me: true, text: "same" }),
-      msg({ ts: "2026-08-30 21:08:22", from_me: false, text: "same" }),
+      msg({ ts: "2026-08-30T21:08:22Z", from_me: true, text: "same" }),
+      msg({ ts: "2026-08-30T21:08:22Z", from_me: false, text: "same" }),
     ], [self]);
     expect(b[0]!.from_me).toBe(true);
   });
@@ -318,8 +322,8 @@ describe("dedupeSelfEcho", () => {
     // carries the text. Same shape as the echo case, opposite truth.
     const self = msg().chat;
     const out = dedupeSelfEcho([
-      msg({ ts: "2026-08-30 21:08:22", from_me: true, text: "", retracted: true }),
-      msg({ ts: "2026-08-30 21:08:22", from_me: false, text: "taken back" }),
+      msg({ ts: "2026-08-30T21:08:22Z", from_me: true, text: "", retracted: true }),
+      msg({ ts: "2026-08-30T21:08:22Z", from_me: false, text: "taken back" }),
     ], [self]);
     expect(out).toHaveLength(1);
     expect(out[0]!.retracted).toBe(true);
@@ -328,30 +332,30 @@ describe("dedupeSelfEcho", () => {
   });
 
   test("a genuine inbound with no empty twin stays theirs", () => {
-    const out = dedupeSelfEcho([msg({ ts: "2026-08-30 21:08:22", from_me: false, text: "theirs" })]);
+    const out = dedupeSelfEcho([msg({ ts: "2026-08-30T21:08:22Z", from_me: false, text: "theirs" })]);
     expect(out[0]!.from_me).toBe(false);
   });
 
   test("keeps legitimate same-direction duplicates at the same timestamp", () => {
     const out = dedupeSelfEcho([
-      msg({ ts: "2026-08-30 21:08:22", text: "same" }),
-      msg({ ts: "2026-08-30 21:08:22", text: "same" }),
+      msg({ ts: "2026-08-30T21:08:22Z", text: "same" }),
+      msg({ ts: "2026-08-30T21:08:22Z", text: "same" }),
     ]);
     expect(out).toHaveLength(2);
   });
 
   test("keeps identical text sent at different times", () => {
     const out = dedupeSelfEcho([
-      msg({ ts: "2026-08-30 21:08:22", text: "ok" }),
-      msg({ ts: "2026-08-30 21:09:00", text: "ok" }),
+      msg({ ts: "2026-08-30T21:08:22Z", text: "ok" }),
+      msg({ ts: "2026-08-30T21:09:00Z", text: "ok" }),
     ]);
     expect(out).toHaveLength(2);
   });
 
   test("leaves an ordinary conversation untouched", () => {
     const out = dedupeSelfEcho([
-      msg({ ts: "2026-08-30 12:00:00", text: "hi" }),
-      msg({ ts: "2026-08-30 12:01:00", from_me: true, text: "hey" }),
+      msg({ ts: "2026-08-30T12:00:00Z", text: "hi" }),
+      msg({ ts: "2026-08-30T12:01:00Z", from_me: true, text: "hey" }),
     ]);
     expect(out).toHaveLength(2);
   });
@@ -367,7 +371,7 @@ describe("loadThread", () => {
       10,
       "2026-08-30",
       DEFAULT_FORMATS,
-      fake({ status: 0, stdout: JSON.stringify([msg({ ts: "2026-08-30 12:00:00" })]) }),
+      fake({ status: 0, stdout: JSON.stringify([msg({ ts: "2026-08-30T12:00:00Z" })]) }),
     );
     expect(r.ok).toBe(true);
     expect(r.bubbles).toHaveLength(1);
@@ -410,9 +414,9 @@ describe("selectThread", () => {
   test("a group filters a mixed recent window down to its own chat, oldest-first", () => {
     const out = selectThread(
       [
-        msg({ chat: guid, ts: "2026-08-30 12:05:00", text: "late" }),
-        msg({ chat: "+15550000000", ts: "2026-08-30 12:04:00", text: "other chat" }),
-        msg({ chat: guid, ts: "2026-08-30 12:00:00", text: "early" }),
+        msg({ chat: guid, ts: "2026-08-30T12:05:00Z", text: "late" }),
+        msg({ chat: "+15550000000", ts: "2026-08-30T12:04:00Z", text: "other chat" }),
+        msg({ chat: guid, ts: "2026-08-30T12:00:00Z", text: "early" }),
       ],
       guid, true, 80,
     );
@@ -426,9 +430,9 @@ describe("selectThread", () => {
     const alias = "a1b2c3d4e5f60718293a4b5c6d7e8f90";
     const out = selectThread(
       [
-        msg({ chat: guid, ts: "2026-08-30 12:05:00", text: "new row" }),
-        msg({ chat: alias, ts: "2026-08-30 12:00:00", text: "old row, before the re-key" }),
-        msg({ chat: "+15550000000", ts: "2026-08-30 12:04:00", text: "a DM, never" }),
+        msg({ chat: guid, ts: "2026-08-30T12:05:00Z", text: "new row" }),
+        msg({ chat: alias, ts: "2026-08-30T12:00:00Z", text: "old row, before the re-key" }),
+        msg({ chat: "+15550000000", ts: "2026-08-30T12:04:00Z", text: "a DM, never" }),
       ],
       guid, true, 80,
     );
@@ -436,7 +440,7 @@ describe("selectThread", () => {
   });
 
   test("keeps only the newest `limit` messages", () => {
-    const raw = Array.from({ length: 5 }, (_, i) => msg({ chat: guid, ts: `2026-08-30 12:0${i}:00`, text: `m${i}` }));
+    const raw = Array.from({ length: 5 }, (_, i) => msg({ chat: guid, ts: `2026-08-30T12:0${i}:00Z`, text: `m${i}` }));
     expect(selectThread(raw, guid, true, 2).map((m) => m.text)).toEqual(["m3", "m4"]);
   });
 
@@ -454,8 +458,23 @@ describe("selectThread", () => {
   });
 
   test("a DM window passes through untouched apart from ordering", () => {
-    const out = selectThread([msg({ ts: "2026-08-30 12:01:00" }), msg({ ts: "2026-08-30 12:00:00" })], "+15551234567", false, 80);
-    expect(out[0]!.ts).toBe("2026-08-30 12:00:00");
+    const out = selectThread([msg({ ts: "2026-08-30T12:01:00Z" }), msg({ ts: "2026-08-30T12:00:00Z" })], "+15551234567", false, 80);
+    expect(out[0]!.ts).toBe("2026-08-30T12:00:00Z");
+  });
+
+  test("a merged DM keeps rows from every alias handle, in either direction", () => {
+    const phone = "+15550100001";
+    const email = "pat@example.com";
+    const raw = [
+      msg({ chat: phone, handle: phone, ts: "2026-09-04T21:32:29Z", text: "sms" }),
+      msg({ chat: email, handle: email, ts: "2026-09-05T17:24:01Z", text: "imessage" }),
+      msg({ chat: "+15550100002", handle: "+15550100002", ts: "2026-09-05T18:00:00Z", text: "other" }),
+    ];
+    const aliases = { [phone]: email };
+    expect(selectThread(raw, email, false, 80, [], aliases).map((m) => m.text))
+      .toEqual(["sms", "imessage"]);
+    expect(selectThread(raw, phone, false, 80, [], aliases).map((m) => m.text))
+      .toEqual(["sms", "imessage"]);
   });
 
   test("loadThread loads a group by EXACT chat id via thread --chat", () => {
@@ -511,10 +530,10 @@ describe("rich decoration", () => {
   test("receipt lands only on the NEWEST read from-me bubble", () => {
     const out = decorate(
       [
-        msg({ ts: "2026-08-31 10:00:00", from_me: true, read_at: "2026-08-31 10:00:30" }),
-        msg({ ts: "2026-08-31 10:05:00", from_me: false }),
-        msg({ ts: "2026-08-31 10:06:00", from_me: true, read_at: "2026-08-31 10:07:12" }),
-        msg({ ts: "2026-08-31 10:08:00", from_me: true }), // sent, not yet read
+        msg({ ts: "2026-08-31T10:00:00Z", from_me: true, read_at: "2026-08-31T10:00:30Z" }),
+        msg({ ts: "2026-08-31T10:05:00Z", from_me: false }),
+        msg({ ts: "2026-08-31T10:06:00Z", from_me: true, read_at: "2026-08-31T10:07:12Z" }),
+        msg({ ts: "2026-08-31T10:08:00Z", from_me: true }), // sent, not yet read
       ],
       today,
     );
@@ -522,8 +541,8 @@ describe("rich decoration", () => {
   });
 
   test("receipt from an earlier day carries the day label", () => {
-    expect(receiptLabel("2026-08-30 21:03:00", today)).toBe("Read Yesterday 9:03 PM");
-    expect(receiptLabel("2026-08-31 16:42:00", today)).toBe("Read 4:42 PM");
+    expect(receiptLabel("2026-08-30T21:03:00Z", today)).toBe("Read Yesterday 9:03 PM");
+    expect(receiptLabel("2026-08-31T16:42:00Z", today)).toBe("Read 4:42 PM");
   });
 
   test("link-preview payload pseudo-attachments are filtered out", () => {
@@ -558,7 +577,7 @@ describe("rich decoration", () => {
           edited: true,
           effect: "confetti",
         }),
-        msg({ ts: "2026-08-31 10:01:00", retracted: true }),
+        msg({ ts: "2026-08-31T10:01:00Z", retracted: true }),
       ],
       today,
     );
@@ -597,4 +616,170 @@ describe("cliChatArg (CLI / IPC bare-digit convenience)", () => {
     expect(cliChatArg("ce5a593a78af408282d61461ade89135")).toBe("ce5a593a78af408282d61461ade89135");
     expect(cliChatArg("chat123456")).toBe("chat123456");
   });
+});
+
+describe("pending sends (the bubble drawn before the Mac writes the row)", () => {
+  const today = "2026-08-30";
+  const now = Date.parse("2026-08-30T12:00:30");
+  const real = (over: Partial<Bubble> = {}): Bubble =>
+    ({ ...decorate([msg({ from_me: true, text: "on my way", ts: "2026-08-30T11:59:00Z" })], today)[0]!, ...over });
+  const send = (over: Partial<PendingSend> = {}): PendingSend => ({ chat: "+15551234567", text: "see you soon", ts: "2026-08-30T12:00:00Z", ...over });
+
+  test("an unresolved send is appended as a pending bubble that joins your run", () => {
+    const r = withPendingSends([real()], [send()], today, DEFAULT_FORMATS, now);
+    expect(r.bubbles).toHaveLength(2);
+    const [prev, mine] = r.bubbles;
+    expect(mine!.pending).toBe(true);
+    expect(mine!.from_me).toBe(true);
+    expect(mine!.text).toBe("see you soon");
+    expect(mine!.time).toBe("12:00 PM");
+    expect(mine!.day).toBe("");                  // same day as the bubble before it
+    expect(mine!.groupStart).toBe(false);
+    expect(prev!.groupEnd).toBe(false);          // the run continues, so the older bubble loses its time
+    expect(prev!.time).toBe("");
+    expect(r.pending).toEqual([send()]);
+  });
+
+  test("the first bubble of an empty thread opens the day", () => {
+    const r = withPendingSends([], [send()], today, DEFAULT_FORMATS, now);
+    expect(r.bubbles[0]!.day).toBe("Today");
+    expect(r.bubbles[0]!.groupStart).toBe(true);
+  });
+
+  test("a reply from them starts a new run", () => {
+    const theirs = decorate([msg({ from_me: false, text: "where are you", ts: "2026-08-30T11:59:00Z" })], today)[0]!;
+    const r = withPendingSends([theirs], [send()], today, DEFAULT_FORMATS, now);
+    expect(r.bubbles[1]!.groupStart).toBe(true);
+    expect(r.bubbles[0]!.time).toBe("11:59 AM");
+  });
+
+  test("the real row resolves the send and nothing is appended", () => {
+    const landed = real({ text: "see you soon", ts: "2026-08-30T12:00:01Z" });
+    const r = withPendingSends([real(), landed], [send()], today, DEFAULT_FORMATS, now);
+    expect(r.bubbles).toHaveLength(2);
+    expect(r.bubbles.some((b) => b.pending)).toBe(false);
+    expect(r.pending).toEqual([]);
+  });
+
+  test("the same text sent twice waits for two rows", () => {
+    const landed = real({ text: "ok", ts: "2026-08-30T12:00:01Z" });
+    const twice = [send({ text: "ok", ts: "2026-08-30T12:00:00Z" }), send({ text: "ok", ts: "2026-08-30T12:00:05Z" })];
+    const r = withPendingSends([landed], twice, today, DEFAULT_FORMATS, now);
+    expect(r.bubbles).toHaveLength(2);
+    expect(r.bubbles[1]!.pending).toBe(true);
+    expect(r.pending).toEqual([twice[1]]);
+  });
+
+  test("an identical message from yesterday does not resolve today's send", () => {
+    const old = real({ text: "see you soon", ts: "2026-08-29T12:00:00Z" });
+    const r = withPendingSends([old], [send()], today, DEFAULT_FORMATS, now);
+    expect(r.bubbles).toHaveLength(2);
+    expect(r.bubbles[1]!.pending).toBe(true);
+  });
+
+  test("a Mac timestamp a little behind the Linux clock still resolves", () => {
+    const landed = real({ text: "see you soon", ts: "2026-08-30T11:58:30Z" });
+    const r = withPendingSends([landed], [send()], today, DEFAULT_FORMATS, now);
+    expect(r.pending).toEqual([]);
+  });
+
+  test("a send two minutes old without a row is given up on, quietly", () => {
+    const stale = send({ ts: "2026-08-30T11:58:00Z" });
+    const r = withPendingSends([real()], [stale], today, DEFAULT_FORMATS, now);
+    expect(r.bubbles).toHaveLength(1);
+    expect(r.pending).toEqual([]);
+  });
+
+  test("a retracted or already-pending bubble never resolves a send", () => {
+    const gone = real({ text: "see you soon", ts: "2026-08-30T12:00:01Z", retracted: true });
+    const r = withPendingSends([gone], [send()], today, DEFAULT_FORMATS, now);
+    expect(r.pending).toHaveLength(1);
+    const again = withPendingSends(r.bubbles, [send()], today, DEFAULT_FORMATS, now);
+    expect(again.bubbles.filter((b) => b.pending)).toHaveLength(2);   // the old pending bubble is not a row
+  });
+
+  test("a URL in a pending bubble is already clickable", () => {
+    const { bubble } = pendingBubble(undefined, send({ text: "look https://example.com" }), today);
+    expect(bubble.html).toContain('<a href="https://example.com">');
+  });
+
+  test("parsePendingSends accepts only well-formed entries", () => {
+    expect(parsePendingSends("nope")).toEqual([]);
+    expect(parsePendingSends(JSON.stringify([{ chat: "a", text: "b", ts: "c" }, { chat: 1 }, null]))).toEqual([{ chat: "a", text: "b", ts: "c" }]);
+  });
+
+  test("loadThread --pending-stdin runs end to end through the CLI", async () => {
+    const proc = Bun.spawn(["bun", "thread.ts", "+15550100001", "5", "--pending-stdin"], {
+      stdin: new TextEncoder().encode(JSON.stringify([{ chat: "+15550100001", text: "hi", ts: localToday() + " 00:00:00" }])),
+      // Offline means offline: no ~/bin/imsg (HOME) AND no accelerator socket
+      // (XDG_RUNTIME_DIR). blip-bridged's socket is found under the latter, so
+      // clearing only HOME left a real, working bridge underneath the test.
+      env: { ...process.env, HOME: "/nonexistent-blip-home", XDG_RUNTIME_DIR: "/nonexistent-blip-runtime" },
+      stdout: "pipe",
+    });
+    const out = JSON.parse(await new Response(proc.stdout).text());
+    expect(out.ok).toBe(false);
+    expect(out.pending).toEqual([{ chat: "+15550100001", text: "hi", ts: localToday() + " 00:00:00" }]);
+  });
+});
+
+describe("Send Later bubbles", () => {
+  test("a waiting scheduled message says when it will send", () => {
+    const [b] = decorate([msg({ from_me: true, ts: "2026-09-17T18:00:00Z", scheduled: true })], "2026-09-16");
+    expect(b!.scheduled).toBe(true);
+    expect(b!.scheduledFor).toContain(clockLabel("2026-09-17T18:00:00Z"));
+  });
+  test("an ordinary bubble carries no schedule fields", () => {
+    const [b] = decorate([msg({ ts: "2026-09-16T12:00:00Z" })], "2026-09-16");
+    expect(b!.scheduled).toBeUndefined();
+  });
+});
+
+describe("tapback targets", () => {
+  test("a bubble carries its row's GUID, or \"\" without one", () => {
+    const out = decorate([msg({ guid: "p-1" }), msg({ ts: "2026-08-30T12:01:00Z" })], "2026-08-30");
+    expect(out.map((b) => b.guid)).toEqual(["p-1", ""]);
+  });
+
+  test("in the self-thread every tapback is yours, and its echo folds into it", () => {
+    // Messages writes your tapback there as an inbound row from your own
+    // address; the menu has to know it is yours to offer taking it back.
+    const self = "+15551234567";
+    const out = selectThread(
+      [msg({
+        chat: self, from_me: true, text: "note",
+        tapbacks: [{ emoji: "❤️", from_me: false, by: "Me" }, { emoji: "❤️", from_me: true, by: null }],
+      })],
+      self, false, 80, [self],
+    );
+    expect(out[0]!.tapbacks).toEqual([{ emoji: "❤️", from_me: true, by: null }]);
+  });
+
+  test("one same-second twin in a 1:1 is a coincidence, not a self-thread", () => {
+    // both sides typing "ok" in the same second must not make their tapback yours
+    const them = [{ emoji: "👍", from_me: false, by: "Test Person" }];
+    const out = selectThread(
+      [msg({ from_me: true, text: "ok" }), msg({ text: "ok", tapbacks: them })],
+      "+15551234567", false, 80, [],
+    );
+    // (the thread view may still fold the pair into one row; the tapback stays theirs)
+    expect(out.flatMap((m) => m.tapbacks ?? [])).toEqual(them);
+  });
+
+  test("anywhere else a tapback stays whoever's it was", () => {
+    const them = [{ emoji: "👍", from_me: false, by: "Test Person" }];
+    const out = selectThread([msg({ tapbacks: them })], "+15551234567", false, 80, []);
+    expect(out[0]!.tapbacks).toEqual(them);
+  });
+});
+
+test("reading a displayed reaction covers its activity without moving the original bubble", () => {
+  const original = "2026-09-01T10:00:00Z";
+  const reaction = "2026-09-01T11:00:00Z";
+  const bubbles = decorate([{ ts: original, activity_ts: reaction, from_me: true,
+    chat: "+15551234567", handle: "+15551234567", name: null, service: "iMessage", text: "fixture",
+    tapbacks: [{ emoji: "❤️", from_me: false, by: null }] }], "2026-09-01");
+  expect(bubbles[0]!.ts).toBe(original);
+  expect(bubbles[0]!.seen_ts).toBe(reaction);
+  expect(bubbles[0]!.tapbacks).toHaveLength(1);
 });

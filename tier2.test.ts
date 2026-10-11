@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
-import { CACHE_DIR, bakeOrientation, cacheFileName, exifOrientation, fetchAttachment, imageMetrics, isImageMime, jpegtranArgs, lruEvictions, sanitizeName, wantsJpeg } from "./fetch";
-import { extFor, existingLocalFile, firstFileUri, pickImageType, snapshotClipboard } from "./paste";
+import { CACHE_DIR, bakeOrientation, cacheFileName, rewrapCaf, exifOrientation, fetchAttachment, imageMetrics, isAnimatedMime, isImageMime, jpegtranArgs, lruEvictions, sanitizeName, wantsJpeg } from "./fetch";
+import { extFor, existingLocalFile, firstFileUri, localFileFromPayload, pickFileType, pickImageType, snapshotClipboard } from "./paste";
 import { resolveTarget, sendFile } from "./send-file";
 import { linkHost, linkify, normalizeLink, selectThread } from "./thread";
 import {
@@ -14,11 +14,11 @@ import {
   safeUrl,
   sniffImage,
 } from "./linkpreview";
-import { AVATAR_DIR, AVATAR_NONE_TTL_MS, AVATAR_TTL_MS, avatarArgs, avatarKey, fetchAvatar } from "./avatar";
-import { readFileSync, writeFileSync, unlinkSync, utimesSync, mkdtempSync } from "node:fs";
+import { AVATAR_DIR, AVATAR_NONE_TTL_MS, AVATAR_RETRY_MS, AVATAR_TTL_MS, avatarArgs, avatarKey, fetchAvatar, fetchAvatarBatch } from "./avatar";
+import { readFileSync, readdirSync, writeFileSync, unlinkSync, utimesSync, mkdtempSync, mkdirSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 
 // A real 16×8 baseline JPEG (ImageMagick, -strip): no APP1 at all.
 const TINY_JPEG = Buffer.from(
@@ -212,6 +212,45 @@ describe("EXIF orientation is baked into cached JPEGs", () => {
   });
 });
 
+describe("clipboard file paste", () => {
+  test("prefers a GNOME file object over URI-list and text", () => {
+    expect(pickFileType(["text/plain", "text/uri-list", "x-special/gnome-copied-files"]))
+      .toBe("x-special/gnome-copied-files");
+  });
+
+  test("extracts an existing local file from both supported payloads", () => {
+    const tmp = `${process.env.XDG_CACHE_HOME}/blip-paste-${process.pid}.vcf`;
+    writeFileSync(tmp, "BEGIN:VCARD\nEND:VCARD\n");
+    const uri = new URL(`file://${tmp}`).href;
+    try {
+      expect(localFileFromPayload("x-special/gnome-copied-files", `copy\n${uri}\n`)).toBe(tmp);
+      expect(localFileFromPayload("text/uri-list", `# contact\r\n${uri}\r\n`)).toBe(tmp);
+    } finally { unlinkSync(tmp); }
+  });
+
+  test("rejects remote URIs and missing local files", () => {
+    expect(localFileFromPayload("text/uri-list", "https://example.com/person.vcf\n")).toBe("");
+    expect(localFileFromPayload("text/uri-list", "file:///definitely/missing/person.vcf\n")).toBe("");
+  });
+
+  test("snapshot returns a file attachment before attempting text", () => {
+    const tmp = `${process.env.XDG_CACHE_HOME}/blip-snapshot-${process.pid}.vcf`;
+    writeFileSync(tmp, "BEGIN:VCARD\nEND:VCARD\n");
+    const calls: string[][] = [];
+    const runner = ((_cmd: string, args: string[]) => {
+      calls.push(args);
+      if (args.includes("--list-types")) {
+        return { status: 0, stdout: "text/plain\nx-special/gnome-copied-files\n" };
+      }
+      return { status: 0, stdout: `copy\n${new URL(`file://${tmp}`).href}\n` };
+    }) as never;
+    try {
+      expect(snapshotClipboard(runner)).toMatchObject({ kind: "file", path: tmp, name: basename(tmp) });
+      expect(calls.some((args) => args.includes("text"))).toBe(false);
+    } finally { unlinkSync(tmp); }
+  });
+});
+
 describe("send-file caption transport", () => {
   test("caption travels on stdin ahead of the file, never in argv (audit #4)", () => {
     let seen: { args: string[]; input: Buffer } | null = null;
@@ -272,9 +311,9 @@ describe("search shaping", () => {
 
   test("attachment-only rows (placeholder char) are dropped", () => {
     const rows = [
-      { ts: "2026-08-31 10:00:00", from_me: false, handle: "+15551234567", name: "A",
+      { ts: "2026-08-31T10:00:00Z", from_me: false, handle: "+15551234567", name: "A",
         service: "iMessage", chat: "+15551234567", text: "￼" },
-      { ts: "2026-08-31 10:01:00", from_me: true, handle: "+15551234567", name: "A",
+      { ts: "2026-08-31T10:01:00Z", from_me: true, handle: "+15551234567", name: "A",
         service: "iMessage", chat: "+15551234567", text: "real match" },
     ] as never[];
     const out = shapeResults(rows, "match", 10);
@@ -285,7 +324,7 @@ describe("search shaping", () => {
 
   test("group hits are flagged and limit respected", () => {
     const rows = Array.from({ length: 5 }, (_, i) => ({
-      ts: `2026-08-31 10:0${i}:00`, from_me: false, handle: "+15551234567", name: "G",
+      ts: `2026-08-31T10:0${i}:00Z`, from_me: false, handle: "+15551234567", name: "G",
       service: "iMessage", chat: "abcdef0123456789abcdef0123456789", text: `hit ${i}`,
     })) as never[];
     const out = shapeResults(rows, "hit", 3);
@@ -299,9 +338,9 @@ describe("search shaping", () => {
       messageMatchScore("cat", "A scatter of leaves."),
     );
     const rows = [
-      { ts: "2026-08-28 17:29:00", from_me: false, handle: "+15550001111", name: "Alice",
+      { ts: "2026-08-28T17:29:00Z", from_me: false, handle: "+15550001111", name: "Alice",
         service: "iMessage", chat: "group-a", text: "A scatter of leaves." },
-      { ts: "2026-05-18 16:34:00", from_me: true, handle: "+15550002222", name: "Bob",
+      { ts: "2026-05-18T16:34:00Z", from_me: true, handle: "+15550002222", name: "Bob",
         service: "iMessage", chat: "+15550002222", text: "The cat sat down." },
     ] as never[];
     const out = shape(rows, "cat", 10);
@@ -312,23 +351,23 @@ describe("search shaping", () => {
   test("query case does not change whole-word recency order", () => {
     const { shapeResults: shape } = require("./search") as typeof import("./search");
     const rows = [
-      { ts: "2026-05-25 22:20:00", from_me: false, handle: "+15550001111", name: "Alice",
+      { ts: "2026-05-25T22:20:00Z", from_me: false, handle: "+15550001111", name: "Alice",
         service: "iMessage", chat: "group-a", text: "Alice thanks Bob." },
-      { ts: "2026-08-25 20:45:00", from_me: false, handle: "+15550002222", name: "Bob",
+      { ts: "2026-08-25T20:45:00Z", from_me: false, handle: "+15550002222", name: "Bob",
         service: "iMessage", chat: "+15550002222", text: "Thanks" },
     ] as never[];
     const lower = shape(rows, "thanks", 10).map((h) => h.ts);
     const titled = shape(rows, "Thanks", 10).map((h) => h.ts);
     expect(lower).toEqual(titled);
-    expect(lower[0]).toBe("2026-08-25 20:45:00");
+    expect(lower[0]).toBe("2026-08-25T20:45:00Z");
   });
 
   test("same match quality ties break on message time, not thread order", () => {
     const { shapeResults: shape } = require("./search") as typeof import("./search");
     const rows = [
-      { ts: "2025-07-15 17:24:00", from_me: false, handle: "+15550001111", name: "Alice",
+      { ts: "2025-07-15T17:24:00Z", from_me: false, handle: "+15550001111", name: "Alice",
         service: "iMessage", chat: "quiet-old-thread", text: "Thanks everyone." },
-      { ts: "2026-05-25 22:20:00", from_me: false, handle: "+15550002222", name: "Bob",
+      { ts: "2026-05-25T22:20:00Z", from_me: false, handle: "+15550002222", name: "Bob",
         service: "iMessage", chat: "busy-new-thread", text: "Alice thanks Bob." },
     ] as never[];
     const out = shape(rows, "thanks", 10);
@@ -363,7 +402,7 @@ describe("search shaping", () => {
     const runner = () => ({
       status: 0,
       stdout: JSON.stringify([{
-        ts: "2026-05-01 10:00:00", from_me: false, handle: "+15550002222", name: "Bob",
+        ts: "2026-05-01T10:00:00Z", from_me: false, handle: "+15550002222", name: "Bob",
         service: "iMessage", chat: "+15550002222", text: "the car is red",
       }]),
       stderr: "",
@@ -386,7 +425,7 @@ describe("search shaping", () => {
     }];
     const msgs = [{
       chat: "+2", name: "Bob", handle: "+2", service: "iMessage",
-      ts: "2026-09-02 10:00:00", from_me: true, text: "ann called", group: false,
+      ts: "2026-09-02T10:00:00Z", from_me: true, text: "ann called", group: false,
     }];
     const out = mergeSearchResults(people, msgs);
     expect(out.map((h) => h.name)).toEqual(["Ann", "Bob"]);
@@ -568,17 +607,52 @@ describe("contact photos", () => {
     unlinkSync(marker);
   });
 
-  test("retry ignores a fresh no-photo marker so a newly set picture is found", () => {
+  // The window asks with retry on every open. Skipping the marker outright
+  // sent every photoless contact back to the Mac each time (~45 s on gus).
+  test("retry trusts a no-photo marker for fifteen minutes, then asks again", () => {
     let calls = 0;
     const miss = (() => ({ status: 1, stdout: Buffer.alloc(0), stderr: "" })) as never;
     const hit = (() => { calls++; return { status: 0, stdout: Buffer.from([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3]), stderr: "" }; }) as never;
     const h = `retry-${Date.now()}@example.com`;
     expect(fetchAvatar(h, miss).ok).toBe(false);
-    expect(fetchAvatar(h, hit).ok).toBe(false);            // marker still fresh
+    expect(fetchAvatar(h, hit, { retry: true }).ok).toBe(false);  // a reopen: the marker answers, no ssh
     expect(calls).toBe(0);
-    expect(fetchAvatar(h, hit, { retry: true }).ok).toBe(true);
+    const marker = `${AVATAR_DIR}/${avatarKey(h)}.none`;
+    const old = new Date(Date.now() - AVATAR_RETRY_MS - 60_000);
+    utimesSync(marker, old, old);
+    expect(fetchAvatar(h, hit).ok).toBe(false);                   // a plain ask still trusts it for a day
+    expect(calls).toBe(0);
+    expect(fetchAvatar(h, hit, { retry: true }).ok).toBe(true);   // retry finds the new picture
     expect(calls).toBe(1);
+    expect(AVATAR_RETRY_MS).toBeLessThan(AVATAR_NONE_TTL_MS);
     unlinkSync(`${AVATAR_DIR}/${avatarKey(h)}.jpg`);
+  });
+
+  test("a batch answers the disk first, each handle once, and asks the Mac only for misses", () => {
+    const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3]);
+    let asked: string[] = [];
+    const runner = ((_c: string, args: string[]) => { asked.push(args[args.length - 1]); return { status: 0, stdout: jpeg, stderr: "" }; }) as never;
+    const t = Date.now();
+    const cached = `batch-a-${t}@example.com`, miss = `batch-b-${t}@example.com`;
+    fetchAvatar(cached, runner);
+    asked = [];
+    const out: Array<{ handle: string; ok: boolean; url: string }> = [];
+    fetchAvatarBatch(`${miss}\n${cached}\r\n${cached}\n\n`, (l) => out.push(JSON.parse(l)), runner, { retry: true });
+    expect(out.map((o) => o.handle)).toEqual([cached, miss]);
+    expect(out.every((o) => o.ok && o.url.startsWith("file://"))).toBe(true);
+    expect(asked).toEqual([miss]);
+    unlinkSync(`${AVATAR_DIR}/${avatarKey(cached)}.jpg`);
+    unlinkSync(`${AVATAR_DIR}/${avatarKey(miss)}.jpg`);
+  });
+
+  test("a batch stops asking once the Mac is unreachable", () => {
+    let calls = 0;
+    const runner = (() => { calls++; return { status: 255, stdout: Buffer.alloc(0), stderr: "" }; }) as never;
+    const t = Date.now();
+    const out: Array<{ handle: string; error: string }> = [];
+    fetchAvatarBatch(`off-a-${t}@example.com\noff-b-${t}@example.com\noff-c-${t}@example.com\n`, (l) => out.push(JSON.parse(l)), runner);
+    expect(calls).toBe(1);
+    expect(out.map((o) => o.error)).toEqual(["Mac unreachable", "Mac unreachable", "Mac unreachable"]);
   });
 
   test("a group id asks for the GROUP's photo (--chat), a person for Contacts (--)", () => {
@@ -612,8 +686,8 @@ describe("war-room hardening (2.1)", () => {
     expect(sanitizeName("写真.png")).toBe("写真.png");
   });
   test("a DM thread never admits the same person's GROUP messages", () => {
-    const dm = { ts: "2026-08-30 12:00:00", from_me: false, handle: "+15551234567", name: "A", service: "iMessage", chat: "+15551234567", text: "dm" } as never;
-    const grp = { ts: "2026-08-30 12:01:00", from_me: false, handle: "+15551234567", name: "A", service: "iMessage", chat: "abcdef0123456789abcdef0123456789", text: "in group" } as never;
+    const dm = { ts: "2026-08-30T12:00:00Z", from_me: false, handle: "+15551234567", name: "A", service: "iMessage", chat: "+15551234567", text: "dm" } as never;
+    const grp = { ts: "2026-08-30T12:01:00Z", from_me: false, handle: "+15551234567", name: "A", service: "iMessage", chat: "abcdef0123456789abcdef0123456789", text: "in group" } as never;
     const out = selectThread([dm, grp], "+15551234567", false, 50);
     expect(out.map((m: { text: string }) => m.text)).toEqual(["dm"]);
   });
@@ -649,6 +723,17 @@ describe("country code + service (2.2.0)", () => {
     expect(normalizeHandle("07911 123456", "44")).toBe("+447911123456");
     expect(normalizeHandle("447911123456", "44")).toBe("+447911123456");
     expect(normalizeHandle("(404) 555-0123", "1")).toBe("+14045550123");
+  });
+  test("the default country code comes from the test's own bridge.conf, never the developer's", () => {
+    // test-setup.ts points XDG_CONFIG_HOME at a scratch dir; without that, a
+    // developer with country_code=47 saw the five NANP cases above fail.
+    const { defaultCountryCode } = require("./contact-search") as typeof import("./contact-search");
+    expect(process.env.XDG_CONFIG_HOME).toBeDefined();   // or the line below writes to ./undefined/
+    const dir = `${process.env.XDG_CONFIG_HOME}/blip`;
+    mkdirSync(dir, { recursive: true });
+    expect(defaultCountryCode()).toBe("1");
+    writeFileSync(`${dir}/bridge.conf`, "country_code=47\n");
+    try { expect(defaultCountryCode()).toBe("47"); } finally { unlinkSync(`${dir}/bridge.conf`); }
   });
   test("SMS threads send files on the SMS service; groups never carry --service", () => {
     let seen: string[] = [];
@@ -765,8 +850,8 @@ describe("the contact graph never rides argv", () => {
   });
 
   test("a bad or absent map degrades ranking, never the search", () => {
-    expect(parseRecency('{"+15550100011":"2026-09-03 09:00:00"}'))
-      .toEqual({ "+15550100011": "2026-09-03 09:00:00" });
+    expect(parseRecency('{"+15550100011":"2026-09-03T09:00:00Z"}'))
+      .toEqual({ "+15550100011": "2026-09-03T09:00:00Z" });
     expect(parseRecency("not json")).toEqual({});
     expect(parseRecency("[1,2,3]")).toEqual({});
     expect(parseRecency("null")).toEqual({});
@@ -829,6 +914,67 @@ describe("multi-photo messages and the preview transform (#Crystal/Thatchers)", 
   });
 });
 
+describe("animated images have to keep moving", () => {
+  /** "GIF89a", then the logical screen size as u16 little-endian. */
+  const gifHeader = (w: number, h: number) => {
+    const b = Buffer.alloc(13);
+    b.write("GIF89a", 0, "ascii");
+    b.writeUInt16LE(w, 6);
+    b.writeUInt16LE(h, 8);
+    return b;
+  };
+
+  test("only the formats that actually animate count", () => {
+    expect(isAnimatedMime("image/gif")).toBe(true);
+    expect(isAnimatedMime("IMAGE/GIF")).toBe(true);          // mimes arrive in any case
+    expect(isAnimatedMime("image/png")).toBe(false);
+    expect(isAnimatedMime("image/heic")).toBe(false);
+    expect(isAnimatedMime("")).toBe(false);
+  });
+
+  test("a GIF auto-fetch is NEVER resampled — sips would flatten it to one frame", () => {
+    const seen: string[][] = [];
+    const runner = ((_c: string, args: string[]) => {
+      seen.push(args);
+      return { status: 0, stdout: gifHeader(498, 372), stderr: "" };
+    }) as never;
+    // The same cap that makes every other image take the resampling path.
+    fetchAttachment("881", "loop.gif", "image/gif", runner, 5 * 1024 * 1024);
+    expect(seen[0]).not.toContain("--max-dim");
+    expect(seen[0]).not.toContain("--jpeg");
+    // …while a still image on that same path still is resampled.
+    fetchAttachment("882", "shot.png", "image/png", runner, 5 * 1024 * 1024);
+    expect(seen[1]).toContain("--max-dim");
+    for (const f of ["881-orig-loop.gif", "882-prev-shot.jpg"]) {
+      try { unlinkSync(`${CACHE_DIR}/${f}`); } catch { /* fine */ }
+    }
+  });
+
+  test("it keeps its own extension and the shared orig slot", () => {
+    // Not "-prev-…jpg": that name is a promise the bytes are a JPEG, and
+    // xdg-open dispatches on the extension.
+    expect(cacheFileName("7", "loop.gif", "image/gif", false)).toBe("7-orig-loop.gif");
+  });
+
+  test("dimensions come from the GIF header, so the bubble can size itself", () => {
+    // 0×0 left the delegate with nothing to compute a height from.
+    expect(imageMetrics(gifHeader(498, 372), "image/gif"))
+      .toEqual({ pixelWidth: 498, pixelHeight: 372, pixelRatio: 1 });
+  });
+
+  test("the panel draws animated mimes with AnimatedImage and stills with Image", () => {
+    const panelSrc = readFileSync(new URL("./BlipView.qml", import.meta.url), "utf8");
+    expect(panelSrc).toContain("AnimatedImage {");
+    expect(panelSrc).toContain("root.isAnimatedMime(chipRow.modelData.mime)");
+    // The still path keeps autoTransform: it is the EXIF fall-back for
+    // anything cached before fetch.ts began baking orientation in.
+    expect(panelSrc).toContain("autoTransform: true");
+    // Only the active renderer loads, or every photo decodes twice.
+    expect(panelSrc).toContain("chipRow.showImage && !attImage.animated ? chipRow.fileUrl : \"\"");
+    expect(panelSrc).toContain("chipRow.showImage && attImage.animated ? chipRow.fileUrl : \"\"");
+  });
+});
+
 describe("cache file names (Astra B#1)", () => {
   const { cacheFileName } = require("./fetch") as typeof import("./fetch");
   test("an unmapped MIME never keeps the sender's extension", () => {
@@ -838,5 +984,204 @@ describe("cache file names (Astra B#1)", () => {
   test("a mapped MIME still gets its own extension", () => {
     expect(cacheFileName("8", "photo.heic", "image/heic")).toBe("8-jpg-photo.jpg");
     expect(cacheFileName("9", "doc.pdf", "application/pdf")).toBe("9-orig-doc.pdf");
+  });
+});
+
+describe("voice messages (CAF) open on Linux", () => {
+  test("an audio/x-caf attachment caches as .ogg, never under the sender's name", () => {
+    expect(cacheFileName("12753", "Audio Message.caf", "audio/x-caf")).toBe("12753-orig-Audio_Message.ogg");
+    // an empty MIME still gets no opener: the bridge must supply one from the UTI
+    expect(cacheFileName("12753", "Audio Message.caf", "")).toBe("12753-orig-Audio_Message.bin");
+  });
+
+  test("rewrapCaf re-encodes from a private temp file, removes it, and keeps the original on failure", () => {
+    const dir = mkdtempSync(join(tmpdir(), "blip-caf-stub-"));
+    const caf = Buffer.from("caff\u0000\u0001fakeopus");
+    const ogg = Buffer.from("OggS\u0000rest");
+    let seen: string[] = [];
+    const ok = rewrapCaf(caf, ((cmd: string, args: string[]) => {
+      seen = [cmd, ...args];
+      const input = args[args.indexOf("-i") + 1];
+      expect(readFileSync(input)).toEqual(caf); // the temp file holds the bytes
+      return { status: 0, stdout: ogg };
+    }) as never, dir);
+    expect(ok).toBe(ogg);
+    expect(seen).toContain("libopus");
+    expect(readdirSync(dir)).toEqual([]); // temp file removed
+
+    expect(rewrapCaf(caf, (() => { throw new Error("no ffmpeg"); }) as never, dir)).toBe(caf);
+    expect(rewrapCaf(caf, (() => ({ status: 1, stdout: Buffer.alloc(0) })) as never, dir)).toBe(caf);
+    // a zero exit that is not an Ogg stream is not trusted
+    expect(rewrapCaf(caf, (() => ({ status: 0, stdout: Buffer.from("junkjunk") })) as never, dir)).toBe(caf);
+    expect(readdirSync(dir)).toEqual([]);
+  });
+
+  test("a real CAF voice message plays as Ogg Opus through ffmpeg", () => {
+    const has = spawnSync("ffmpeg", ["-version"]).status === 0;
+    if (!has) return;
+    const dir = mkdtempSync(join(tmpdir(), "blip-caf-"));
+    const src = join(dir, "v.caf");
+    const mk = spawnSync("ffmpeg", ["-v", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=0.5",
+      "-c:a", "libopus", "-f", "caf", src]);
+    if (mk.status !== 0) return; // this ffmpeg cannot write CAF+Opus; the stub test above still covers the logic
+    const out = rewrapCaf(readFileSync(src), undefined, dir);
+    expect(out.subarray(0, 4).toString("latin1")).toBe("OggS");
+  });
+});
+
+describe("bridgeRun: the fast path is optional and invisible", () => {
+  const { bridgeRun } = require("./collector") as typeof import("./collector");
+
+  test("a caller with its own runner never touches the socket", () => {
+    // This is what keeps every other test in this suite honest: they inject a
+    // runner and assert on real argv, so the accelerator must stay out of the
+    // way entirely when one is supplied.
+    const seen: { cmd: string; args: string[] }[] = [];
+    const runner = ((cmd: string, args: string[]) => {
+      seen.push({ cmd, args });
+      return { status: 0, stdout: "[]", stderr: "" };
+    }) as never;
+    const res = bridgeRun(["--json", "recent", "5"], runner);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.cmd).toContain("/bin/imsg");
+    expect(seen[0]!.args).toEqual(["--json", "recent", "5"]);
+    expect(res.status).toBe(0);
+    expect(res.stdout).toBe("[]");
+  });
+
+  test("a stdin payload is passed through, never folded into argv", () => {
+    // Message text must not ride argv on either machine (audit #4).
+    const seen: { args: string[]; opts: { input?: string } }[] = [];
+    const runner = ((_c: string, args: string[], opts: { input?: string }) => {
+      seen.push({ args, opts });
+      return { status: 0, stdout: "[]", stderr: "" };
+    }) as never;
+    bridgeRun(["--json", "search", "--stdin"], runner, { input: "secret words" });
+    expect(seen[0]!.opts.input).toBe("secret words");
+    expect(seen[0]!.args.join(" ")).not.toContain("secret");
+  });
+
+  test("a non-zero exit is reported, not swallowed", () => {
+    const runner = (() => ({ status: 3, stdout: "", stderr: "imsg: boom" })) as never;
+    const res = bridgeRun(["--json", "recent", "5"], runner);
+    expect(res.status).toBe(3);
+    expect(res.stderr).toContain("boom");
+  });
+});
+
+describe("the accelerator socket is trusted only when it is provably ours", () => {
+  const { bridgeSocketPath, trustedBridgeSocket, parseBridgeFrame } =
+    require("./collector") as typeof import("./collector");
+  const fs = require("node:fs") as typeof import("node:fs");
+  const uid = process.getuid!();
+
+  /** base/blip/bridge.sock, all private, with a real unix socket bound there. */
+  function layout() {
+    const base = mkdtempSync(join(tmpdir(), "blip-rt-"));
+    fs.chmodSync(base, 0o700);
+    const dir = join(base, "blip");
+    mkdirSync(dir, { mode: 0o700 });
+    const sock = join(dir, "bridge.sock");
+    // A bound socket inode outlives the process that bound it.
+    const r = spawnSync("python3", ["-c",
+      "import os,socket,sys; os.umask(0o077); socket.socket(socket.AF_UNIX).bind(sys.argv[1])", sock]);
+    expect(r.status).toBe(0);
+    return { base, dir, sock, env: { XDG_RUNTIME_DIR: base } };
+  }
+
+  test("the path follows the daemon: XDG_RUNTIME_DIR, else /tmp/blip-<uid>", () => {
+    expect(bridgeSocketPath({ XDG_RUNTIME_DIR: "/run/user/1000" }, 1000)).toBe("/run/user/1000/blip/bridge.sock");
+    expect(bridgeSocketPath({}, 1000)).toBe("/tmp/blip-1000/blip/bridge.sock");
+    expect(bridgeSocketPath({ XDG_RUNTIME_DIR: "relative" }, 1000)).toBeNull();
+    expect(bridgeSocketPath({}, null)).toBeNull();
+  });
+
+  test("a private tree with our socket is used", () => {
+    const l = layout();
+    expect(trustedBridgeSocket(l.env, uid)).toBe(l.sock);
+  });
+
+  test("a missing socket is no socket", () => {
+    const l = layout();
+    fs.unlinkSync(l.sock);
+    expect(trustedBridgeSocket(l.env, uid)).toBeNull();
+  });
+
+  test("anyone else's tree, or one others can write, is refused", () => {
+    const l = layout();
+    expect(trustedBridgeSocket(l.env, uid + 1)).toBeNull();      // owned by someone else
+    fs.chmodSync(l.dir, 0o777);
+    expect(trustedBridgeSocket(l.env, uid)).toBeNull();          // blip/ open to others
+    fs.chmodSync(l.dir, 0o700);
+    fs.chmodSync(l.base, 0o755);
+    expect(trustedBridgeSocket(l.env, uid)).toBeNull();          // base readable by others
+    fs.chmodSync(l.base, 0o700);
+    fs.chmodSync(l.sock, 0o666);
+    expect(trustedBridgeSocket(l.env, uid)).toBeNull();          // socket open to others
+    fs.chmodSync(l.sock, 0o600);
+    expect(trustedBridgeSocket(l.env, uid)).toBe(l.sock);
+  });
+
+  test("a symlink anywhere in the path is refused, never followed", () => {
+    const l = layout();
+    const other = mkdtempSync(join(tmpdir(), "blip-rt-link-"));
+    fs.chmodSync(other, 0o700);
+    fs.symlinkSync(l.dir, join(other, "blip"));
+    expect(trustedBridgeSocket({ XDG_RUNTIME_DIR: other }, uid)).toBeNull();
+    const linkedBase = join(tmpdir(), `blip-rt-base-${process.pid}-${Date.now()}`);
+    fs.symlinkSync(l.base, linkedBase);
+    expect(trustedBridgeSocket({ XDG_RUNTIME_DIR: linkedBase }, uid)).toBeNull();
+    fs.unlinkSync(linkedBase);
+    fs.unlinkSync(l.sock);
+    fs.writeFileSync(join(other, "real.sock"), "");
+    fs.symlinkSync(join(other, "real.sock"), l.sock);
+    expect(trustedBridgeSocket(l.env, uid)).toBeNull();
+  });
+
+  test("a regular file where the socket should be is refused", () => {
+    const l = layout();
+    fs.unlinkSync(l.sock);
+    writeFileSync(l.sock, "", { mode: 0o600 });
+    expect(trustedBridgeSocket(l.env, uid)).toBeNull();
+  });
+
+  test("the fast path asks the trust check, not just existsSync", () => {
+    const src = readFileSync(new URL("./collector.ts", import.meta.url), "utf8");
+    const fast = src.slice(src.indexOf("function viaBridgeSocket"), src.indexOf("export function fetchMessages"));
+    expect(fast).toContain("trustedBridgeSocket()");
+    expect(fast).not.toContain("existsSync");
+  });
+
+  test("frames: a reply, a failure, and the daemon's fallback", () => {
+    const frame = (head: object, body: string) => Buffer.from(JSON.stringify(head) + "\n" + body);
+    expect(parseBridgeFrame(frame({ status: 0, len: 2 }, "[]"))).toEqual({ status: 0, stdout: "[]", stderr: "" });
+    expect(parseBridgeFrame(frame({ status: 1, len: 5 }, "boom\n"))).toEqual({ status: 1, stdout: "", stderr: "boom\n" });
+    // fallback means "ask the one-shot path", even though it has a body and a status
+    expect(parseBridgeFrame(frame({ fallback: true, status: 75, len: 4 }, "busy"))).toBeNull();
+    expect(parseBridgeFrame(frame({ status: 0, len: 10 }, "short"))).toBeNull();
+    expect(parseBridgeFrame(Buffer.from("no newline"))).toBeNull();
+    expect(parseBridgeFrame(Buffer.from("not json\n"))).toBeNull();
+    expect(parseBridgeFrame(frame({ status: "0", len: 2 }, "[]"))).toBeNull();
+  });
+});
+
+describe("bridgeRun keeps source routing", () => {
+  const { bridgeRun } = require("./collector") as typeof import("./collector");
+
+  test("the one-shot spawn is the configured shim, from bin_dir", () => {
+    const home = mkdtempSync(join(tmpdir(), "blip-bindir-"));
+    mkdirSync(join(home, ".config/blip"), { recursive: true });
+    writeFileSync(join(home, ".config/blip/bridge.conf"), "host=you@your-mac\nbin_dir=$HOME/.local/bin\n");
+    const saved = process.env.HOME;
+    process.env.HOME = home;
+    try {
+      const seen: string[] = [];
+      const runner = ((cmd: string) => { seen.push(cmd); return { status: 0, stdout: "[]", stderr: "" }; }) as never;
+      bridgeRun(["--json", "groups"], runner);
+      bridgeRun(["--json", "thread", "--chat", "+15551234567", "5"], runner, {}, "+15551234567");
+      expect(seen).toEqual([join(home, ".local/bin/imsg"), join(home, ".local/bin/imsg")]);
+    } finally {
+      process.env.HOME = saved;
+    }
   });
 });

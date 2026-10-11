@@ -9,10 +9,11 @@
  * sidebar thread list (name/handle/chat id only; never message bodies).
  */
 
+import { shimPath } from "./shim-path";
 import { homedir } from "node:os";
 import { readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { chatKey, isGroupChat, type ImsgMessage } from "./collector";
+import { chatKey, dedupeSelfEcho, isGroupChat, type ImsgMessage } from "./collector";
 import { fuzzyScore } from "./contact-search";
 
 const HOME = process.env.HOME ?? homedir();
@@ -80,17 +81,16 @@ export function messageMatchScore(query: string, text: string): number {
  *  rows are dropped. Self-thread echo twins collapse to one hit. */
 export function shapeResults(raw: ImsgMessage[], query: string, limit: number): SearchHit[] {
   const out: (SearchHit & { score: number })[] = [];
-  const seen = new Map<string, boolean>();
-  for (const m of raw) {
+  // Use the thread loader's sender-aware echo rules before discarding empty
+  // bodies: an empty outgoing self row can identify its decoded incoming twin.
+  // Outgoing rows lead. `imsg search` answers newest first, and a self-thread
+  // message that Messages in iCloud re-synced has SEVERAL incoming copies;
+  // dedupeSelfEcho folds a copy only into a row of the opposite direction, so
+  // two copies ahead of the sent row left one behind as an incoming hit.
+  const rows = [...raw].sort((a, b) => Number(b.from_me === true) - Number(a.from_me === true));
+  for (const m of dedupeSelfEcho(rows)) {
     const body = (m.text ?? "").replace(/\uFFFC/g, "").trim();
     if (body === "") continue;
-    // A twin is the self-thread ECHO: same chat, second and text, OPPOSITE
-    // direction. Two members answering "yes" in the same second are two
-    // messages (Astra B#7).
-    const twinKey = `${chatKey(m)}\0${m.ts}\0${body}`;
-    const prior = seen.get(twinKey);
-    if (prior !== undefined && prior !== Boolean(m.from_me)) continue;
-    seen.set(twinKey, Boolean(m.from_me));
     out.push({
       chat: chatKey(m),
       name: m.name ?? m.handle ?? chatKey(m),
@@ -171,7 +171,7 @@ export function runSearch(
   // "--" so a query starting with "-" is a query, not a flag.
   // The query is message text the moment someone pastes a sentence into the
   // box: stdin to the bridge, never argv on either machine (Astra B#2).
-  const res = runner(`${HOME}/bin/imsg`, ["--json", "search", "--stdin", String(limit * 2)], {
+  const res = runner(shimPath("imsg"), ["--json", "search", "--stdin", String(limit * 2)], {
     encoding: "utf8",
     timeout: 20000,
     input: q,

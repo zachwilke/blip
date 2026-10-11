@@ -12,13 +12,14 @@ inventory of what lands on disk.
 | `~/.ssh/blip_ed25519` | Blip's dedicated ssh key — confined on the Mac to the bridge tools | — |
 | `~/.config/blip/allowlist.json` | handles allowed to raise desktop toasts | message text |
 | `~/.config/blip/mutelist.json` | handles and phrases you typed, whose conversations Blip hides entirely | message text Blip received |
-| `~/.local/state/blip/state.json` (0600, atomic) | poll watermark, read marks, per-chat unread counts and oldest-unread timestamps, self-chat ids, group names/members, opaque SHA-256 toast keys | **message bodies — ever** |
+| `~/.local/state/blip/state.json` (0600, atomic) | poll watermark, read marks, per-chat unread counts and oldest-unread timestamps, pending read actions and retry status, self-chat ids, group names/members, opaque SHA-256 toast keys | **message bodies — ever** |
+| `~/.local/state/blip/audit-cache.json` (0600, parent 0700) | bounded contact-scan summaries: handles, candidate names, source labels, counts, opaque card tokens, and freshness fingerprints | message bodies, photos, full contact cards |
 | `~/.local/state/blip/window.json` | whether the app window was open, its size | anything else |
 | `~/.cache/blip/att/` (0700, files 0600, 500 MB LRU, no expiry) | attachments you viewed, plus images ≤ 5 MB and link-preview thumbnails in any conversation you *open* (they render inline, so they are fetched when the thread is). HEIC arrives converted to JPEG. File names carry the Mac's attachment row id and a sanitized name whose extension follows the MIME type | attachments in conversations you never opened |
 | `~/.cache/blip/linkpreview/` (0700, files 0600, 7-day TTL) | title, description and picture of pages linked in your messages, for links Messages did not decorate | anything from a page nobody linked you to |
 | `~/.cache/blip/avatars/` (0700, files 0600, 7-day TTL) | contact photos for people in your thread list, named by a hash of the handle; an empty `.none` marker for contacts without one | names, numbers |
 | `$XDG_RUNTIME_DIR/blip/` (tmpfs, 0700) | images pasted into the compose box; a 60s AddressBook dump (`contacts-dump.json`, names, phones, emails) for live new-message search; swept after an hour and gone at logout | message bodies |
-| `~/bin/imsg`, `~/bin/imsg-send`, `~/bin/contacts` | the bridge shim (a bash script) | — |
+| `~/bin/imsg`, `~/bin/imsg-send`, `~/bin/imsg-read`, `~/bin/imsg-react`, `~/bin/contacts`, `~/bin/contact-save` (or `bin_dir=` in `bridge.conf`) | the bridge shim (a bash script) | — |
 
 **Marking a conversation read is visible to the sender.** Blip can now tell
 Messages on the Mac that you have read something (`push_read=` in
@@ -43,30 +44,58 @@ toasts show a sender name and a preview through your notification daemon,
 gated by the allowlist — and your notification daemon may keep its own
 history. Blip itself keeps one log, `~/.local/state/blip/push-read.log` (timestamps, the `imsg-read` arguments — `--all`, or a handle when `push_read=thread` — exit codes and its status line; never message content), and nothing else; the shell's stderr (journald) sees
 recipients and exit codes, never bodies (`imsg-send` prints a byte count).
-Message bodies do pass through process arguments on both machines, visible
-to other processes running as you.
+Message bodies do not pass through bridge process arguments; they use stdin.
+The read-state snapshot contains identifiers, counts, timestamps and aliases only.
 
 Threat model and the audit findings behind these notes: [SECURITY.md](SECURITY.md).
+
+### Security-code autofill
+
+With `otp_autofill=on`, one pending code lives in Blip's private helper for at
+most five minutes. Filling, dismissing, replacing it, disabling autofill or
+exiting clears that reference. Focus changes preserve the original deadline.
+No code is added to a file, process arguments, environment, clipboard or
+notification history. The prompt shows that a code is available, not its digits.
+The original message remains in Messages and Blip's conversation model.
+
+The helper reads native accessibility labels, field types, character counts,
+field bounds and the document origin. It checks nearby inputs to recognize a
+row of digit boxes. It does not read input values or log this metadata. Codes
+and metadata cross bounded inherited pipes; no public autofill IPC is added.
+Enabling autofill enables the session accessibility bus without turning on a
+screen reader. That shared bus remains enabled when Blip stops.
 
 ## On the Mac
 
 | Path | Contains |
 |---|---|
-| `~/.blip/bin/` | the bridge tools (`imsg`, `imsg-send`, `contacts`, `tcc-check`, `blip-check`) |
+| `~/.blip/bin/` | the bridge tools (`imsg`, `imsg-send`, `imsg-read`, `imsg-react`, `contacts`, `contact-save`, `tcc-check`, `blip-check`, `blip-dispatch`) |
+| `~/.blip/contact-save.lock` | empty serialization lock; no message or contact data |
 | `~/.blip/src/` | the installer's copy of the same files |
 | `~/Pictures/.blip-outbox/<id>/` | a file you are sending, for the seconds until Messages copies it into its own store; then moved to `~/.blip/sent` (leftovers older than an hour are swept) |
 | `~/.blip/sent/<id>/` (200 MB LRU) | files Blip sent — kept because Messages often leaves the attachment record pointing at the staging path instead of copying it, and Blip would otherwise never be able to show your own photo again |
 
 The tools read `~/Library/Messages/chat.db`, the AddressBook database, and
 Messages' pinning preferences read-only, and drive Messages.app through
-AppleScript. They write nothing else. Messages.app itself keeps your
-conversation history exactly as it always has.
+AppleScript. Contact creation writes a new card through the native address
+book API. Contact drafts stay in memory and cross bounded stdin, never argv
+or persistent Linux storage. Messages.app itself keeps your
+conversation history exactly as it always has. Read, pin, and alert
+actions use `~/.blip/messages-ui.lock` to serialize access to Messages'
+selected conversation; the lock contains no message data.
+
+Contact review reads bounded names, account labels, matching-field counts,
+and opaque card tokens from Mac Contacts. Raw database identifiers stay on the
+Mac. **Open in Contacts on Mac** opens an exact revalidated card without
+editing it. The feature saves no display-name choices or appearance settings.
 
 ## Permissions the Mac asks for
 
 - **Full Disk Access** for `/usr/libexec/sshd-keygen-wrapper` — so an ssh
   session can read `chat.db`.
 - **Automation → Messages** for the same — so an ssh session can send.
+- Optional **Automation → Contacts** for the same — to verify that review cards
+  still exist in Contacts.
 
 Both are one-time grants in System Settings; `blip-check` reports which are
 missing. Blip never asks for Contacts, Camera, Microphone, or Location.
@@ -74,12 +103,59 @@ missing. Blip never asks for Contacts, Camera, Microphone, or Location.
 ## What crosses the network
 
 Ssh between the two machines, plus — when `link_previews` is on — an HTTPS fetch of a linked page and its preview image, made from the Linux box to that site (see above): message queries and previews, ordered
-conversation-pin metadata, attachment bytes you request, and files you send.
+conversation-pin metadata, bounded contact-review summaries, attachment bytes you request, and files you send.
 Push notifications use a
 content-free "something changed" ping — a watcher on the Mac emits a
 timestamp when `chat.db` changes; the client then fetches privately.
 
 ## What Blip cannot do
 
-Send tapbacks, edit or unsend, see typing indicators.
+Edit or unsend, see typing indicators.
 Those need Apple private APIs that Blip deliberately does not use.
+Tapbacks are the opt-in exception (`tapbacks=on`): they are Messages' own
+actions, performed through Accessibility, not a private API.
+
+The menubar panel saves only its preferred width and height in
+`$HOME/.local/state/blip/panel.json` (0600). No draft or conversation content
+is included. The dimensions are clamped to the current display on use.
+Contact scans include conversation handles and group participants, with up to
+10,000 distinct handles from the bounded conversation list. Mac requests stay
+under 200 handles and 48 KiB; oversized responses are split into smaller
+requests. A scan has a three-minute deadline and rejects changing Contacts
+fingerprints instead of caching a partial result. The owner-only scan cache
+holds at most 16 MiB of contact summaries; QML receives 40 findings per page,
+under its existing 48 KiB response limit. Scan input is metadata only, bounded
+to 4 MiB on stdin. No message bodies enter the scan.
+The read-only detail viewer resolves an explicit source-card token again before
+reading that card. Names, phone/email/website labels, addresses, dates, related
+people, social profiles, and notes stay in process memory on Linux. Details
+are never written to the audit cache. Requests and responses use the existing
+48 KiB bridge contract, with at most 160 fields, 32 values per collection,
+80-character labels, and 4,096-character values; oversized cards report an
+error instead of silently dropping fields. The reader uses the existing
+AddressBook object layer and enables no Contacts mutation operations.
+Copy vCard exports only the explicitly selected source card, revalidating its
+opaque token on the Mac. Apple's AddressBook vCard representation supplies the
+file; Blip does not merge or save cards in Contacts. The export is limited to
+2 MiB (3 MiB for the base64 JSON response). Contact bytes travel on bounded
+stdin/stdout, never argv, and never pass through the QML model.
+
+An explicit copy creates a private `.vcf` file under
+`$XDG_RUNTIME_DIR/blip/vcards` (directories 0700, files 0600) and places a file
+reference on the clipboard as `text/uri-list` for native file pasting. Each
+copy gets a separate random subdirectory, so its basename can remain the
+contact’s short name without replacing a previous export. Short names come
+from the selected vCard’s nickname or given-name fields; card bytes remain
+unchanged. Runtime directories are pinned and reject links
+or incorrect ownership/permissions. On each copy, Blip removes its files older
+than 24 hours and retains at most 32 files including the new one. Runtime
+files disappear when the login runtime directory is cleared. This is contact
+export data, not message content; no message text is persisted.
+
+Save vCard opens a folder picker (zenity), starting in the configured Downloads
+folder. The export is saved only after a folder is chosen. The destination
+is pinned, the file is created privately (0600), and publication never replaces
+an existing file or symbolic link; duplicate names receive a numbered suffix.
+Saved files are permanent user exports, outside runtime cleanup. Cancelling
+creates no file and leaves the clipboard unchanged. The folder-picker result
+is capped at 4,097 bytes with a five-minute deadline.

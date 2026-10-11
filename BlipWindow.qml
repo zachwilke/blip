@@ -15,15 +15,17 @@ import qs.Commons
 // (tapbacks, receipts, inline photos, replies, search, composer,
 // attachments). No PanelKeyCatcher here — a normal window keeps normal
 // editor/Tab behavior; Esc unwinds the view (thread → list, search → list)
-// and closes the window only when there is nothing left to unwind.
+// and closes the window only when there is nothing left to unwind. Up/Down
+// and Enter walk the thread list while no editor has focus.
 FloatingWindow {
   id: win
   property var hostWidget: null
   // "Blip (3)" while unread exists — selectors match the "Blip" PREFIX.
-  title: "Blip" + (hostWidget && hostWidget.unread > 0 ? " (" + hostWidget.unread + ")" : "")
+  property string restorationTitle: ""
+  title: restorationTitle || "Blip" + (hostWidget && hostWidget.unread > 0 ? " (" + hostWidget.unread + ")" : "")
   // Same fill as Omarchy's other FloatingWindow (dev gallery). A 0.70
   // alpha assumed Hyprland blur, which Omarchy 4.x ships off.
-  color: Color.background
+  color: hostWidget && hostWidget.appearance ? hostWidget.appearance.background : Color.background
   implicitWidth: 1040
   implicitHeight: 720
   minimumSize: Qt.size(720, 480)
@@ -42,6 +44,7 @@ FloatingWindow {
   readonly property bool loading: view.loading
   readonly property bool rendered: view.rendered
   readonly property string seenTs: view.seenTs
+  readonly property bool peeking: view.peeking
   readonly property string activeLastTs: view.activeLastTs
   function openThread(t) { view.openThread(t) }
   function shareLink(url) { return view.shareLink(url) }
@@ -59,9 +62,131 @@ FloatingWindow {
 
   // ---- persistence: the window lives inside the shell process, so every
   // omarchy-restart-shell (every plugin deploy/update) would kill it. Remember
-  // "was open" + size in ~/.local/state/blip/window.json and restore on start.
+  // "was open", size and workspace in window.json; restore quietly on start.
+  // Idle/DPMS remaps as a new client on the focused workspace — that is not a
+  // new home. Only a user move updates savedWorkspace; a remap is sent back.
   readonly property string stateDir: Quickshell.env("HOME") + "/.local/state/blip"
+  readonly property string restoreScript: Qt.resolvedUrl("window-restore.ts").toString().replace(/^file:\/\//, "")
   property bool restoring: true
+  property bool restoreReady: false
+  property bool explicitShow: false
+  property string savedWorkspace: ""
+  // Match this shell process and this exact window, never another app's title.
+  readonly property var ownToplevel: Hyprland.toplevels.values.find(function(t) {
+    return Number(t.lastIpcObject.pid) === Quickshell.processId && t.title === win.title
+  }) || null
+  readonly property string currentWorkspace: ownToplevel && ownToplevel.workspace
+    ? String(ownToplevel.workspace.name) : ""
+  function ourAddress() {
+    return ownToplevel && ownToplevel.lastIpcObject ? String(ownToplevel.lastIpcObject.address || "") : ""
+  }
+  function sameAddress(a, b) {
+    // Raw Hyprland IPC events give bare hex ("5b5a..."); lastIpcObject.address
+    // is 0x-prefixed. Strip both before comparing or a real user move is
+    // never recognized and gets reverted by strayReturn as a stray remap.
+    function norm(x) { return String(x).toLowerCase().replace(/^0x/, "") }
+    return !!a && !!b && norm(a) === norm(b)
+  }
+  function eventParts(event, count) {
+    try { if (event && event.parse) return event.parse(count) } catch (e) { }
+    return String(event && event.data ? event.data : "").split(",")
+  }
+  // Keep in lockstep with workspaceDecision() in window-restore.ts.
+  function workspaceDecision(incoming, reason) {
+    if (!incoming) return "ignore"
+    // Lockstep with window-restore.ts: only a deliberate move claims a home.
+    if (savedWorkspace === "") return reason === "move" ? "save" : "ignore"
+    if (incoming === savedWorkspace) return "ignore"
+    if (reason === "move") return "save"
+    if (reason === "map" || reason === "monitor") return "return"
+    return "ignore"
+  }
+  function runRestore() {
+    var args = ["bun", restoreScript]
+    for (var i = 0; i < arguments.length; i++) args.push(String(arguments[i]))
+    Quickshell.execDetached(args)
+  }
+  // With every output gone Hyprland 0.56 segfaults moving a floating window,
+  // so a stray waits for monitoradded (window-restore.ts moveIsSafe()).
+  function hasRealScreen() {
+    for (var i = 0; i < Quickshell.screens.length; i++) {
+      var s = Quickshell.screens[i]
+      if (s && s.name && s.width > 0 && s.height > 0) return true
+    }
+    return false
+  }
+  function applyWorkspaceDecision(incoming, reason, addr) {
+    if (restoring) return
+    var decision = workspaceDecision(incoming, reason)
+    if (decision === "save") {
+      savedWorkspace = incoming
+      saveWinState()
+      if (savedWorkspace !== "") runRestore("home", savedWorkspace)
+    } else if (decision === "return" && savedWorkspace !== "" && hasRealScreen()) {
+      runRestore("return", savedWorkspace, addr || ourAddress())
+    }
+  }
+  Connections {
+    target: Hyprland
+    function onRawEvent(event) {
+      var name = event.name
+      // New toplevels initially have no IPC metadata (including their PID).
+      if (name === "openwindow" || name === "movewindowv2" || name === "monitoradded" || name === "monitorremoved")
+        Hyprland.refreshToplevels()
+      if (name === "openwindow") {
+        var open = win.eventParts(event, 4)
+        var title = String(open[3] || "")
+        if (String(open[2] || "") === "org.quickshell" && /^Blip( \([0-9]+\))?$/.test(title))
+          win.applyWorkspaceDecision(String(open[1] || ""), "map", String(open[0] || ""))
+      } else if (name === "movewindowv2") {
+        var moved = win.eventParts(event, 3)
+        if (win.sameAddress(moved[0], win.ourAddress()))
+          win.applyWorkspaceDecision(String(moved[2] || ""), "move", String(moved[0] || ""))
+      } else if (name === "monitoradded" || name === "monitorremoved") {
+        Qt.callLater(function() {
+          if (win.currentWorkspace !== "") win.applyWorkspaceDecision(win.currentWorkspace, "monitor", win.ourAddress())
+        })
+      }
+    }
+  }
+  onCurrentWorkspaceChanged: {
+    if (restoring || currentWorkspace === "") return
+    if (savedWorkspace === "") applyWorkspaceDecision(currentWorkspace, "map", ourAddress())
+    else if (currentWorkspace !== savedWorkspace) strayReturn.restart()
+  }
+  Timer {
+    id: strayReturn
+    interval: 400
+    repeat: false
+    onTriggered: {
+      if (win.restoring || win.currentWorkspace === "" || win.currentWorkspace === win.savedWorkspace) return
+      win.applyWorkspaceDecision(win.currentWorkspace, "map", win.ourAddress())
+    }
+  }
+  onOwnToplevelChanged: {
+    if (ownToplevel && restorationTitle !== "") Qt.callLater(function() { restorationTitle = "" })
+  }
+  function requestShow() {
+    explicitShow = true
+    if (restoreReady) visible = true
+  }
+  Process {
+    id: prepareRestore
+    command: ["bun", win.restoreScript, "prepare", win.savedWorkspace]
+    stdout: StdioCollector {
+      onStreamFinished: {
+        try { win.restorationTitle = JSON.parse(text).title || "" } catch (e) { }
+      }
+    }
+    onExited: (code, status) => {
+      win.restoreReady = true
+      win.restoring = false
+      // Failure leaves the window closed rather than stealing the workspace.
+      // An explicit launch can still open it normally.
+      if (code === 0 || win.explicitShow) win.visible = true
+      if (win.hostWidget && win.visible) win.hostWidget.refresh(true, false)
+    }
+  }
   FileView {
     id: winState
     path: win.stateDir + "/window.json"
@@ -70,7 +195,7 @@ FloatingWindow {
   }
   function saveWinState() {
     if (restoring) return
-    var j = JSON.stringify({ visible: visible, width: Math.round(width), height: Math.round(height) })
+    var j = JSON.stringify({ visible: visible, width: Math.round(width), height: Math.round(height), workspace: savedWorkspace })
     // detached: a Process object drops writes while a previous one is alive,
     // and hideWindow() destroying this window mid-write lost the "hidden" state
     Quickshell.execDetached(["sh", "-c",
@@ -81,9 +206,10 @@ FloatingWindow {
     try {
       var d = JSON.parse(winState.text())
       if (d && d.width >= 720 && d.height >= 480) { implicitWidth = d.width; implicitHeight = d.height }
-      if (d && d.visible === true) Qt.callLater(function() { win.visible = true; if (win.hostWidget) win.hostWidget.refresh(true, false) })
+      if (d && typeof d.workspace === "string") savedWorkspace = d.workspace
+      if (d && d.visible === true) { prepareRestore.running = true; return }
     } catch (e) { /* first run */ }
-    Qt.callLater(function() { win.restoring = false })
+    Qt.callLater(function() { win.restoring = false; win.restoreReady = true; if (win.explicitShow) win.visible = true })
   }
   onVisibleChanged: { saveWinState(); if (visible) Qt.callLater(view.focusDefault) }
   onWidthChanged: if (visible) saveWinState()
@@ -111,6 +237,10 @@ FloatingWindow {
       Keys.priority: Keys.BeforeItem
       Keys.onPressed: function(event) {
         if (event.key === Qt.Key_Escape && view.catchEscape()) {
+          event.accepted = true
+          return
+        }
+        if (view.catchNavKey(event.key)) {
           event.accepted = true
           return
         }

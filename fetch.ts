@@ -16,6 +16,7 @@
  * at 500 MB, evicted after each write.
  */
 
+import { shimPath } from "./shim-path";
 import { homedir } from "node:os";
 import { spawnSync } from "node:child_process";
 import {
@@ -52,6 +53,18 @@ export function wantsJpeg(mime: string): boolean {
   return mime === "image/heic" || mime === "image/heif";
 }
 
+/**
+ * Formats whose whole point is that they MOVE.
+ *
+ * The inline preview path asks the Mac to resample with sips, which flattens
+ * an animated GIF to a single frame — a 1.4 MB animation arrived as a 198 KB
+ * still. So these never take that path: they cross as their original bytes,
+ * capped like any other auto-fetch, and land in the shared `orig` cache slot.
+ */
+export function isAnimatedMime(mime: string): boolean {
+  return String(mime || "").toLowerCase() === "image/gif";
+}
+
 /** Anything the panel would draw inline. */
 export function isImageMime(mime: string): boolean {
   return String(mime || "").startsWith("image/");
@@ -69,6 +82,10 @@ const MIME_EXT: Record<string, string> = {
   "image/heic": "jpg", "image/heif": "jpg", "image/tiff": "tiff", "image/bmp": "bmp",
   "video/mp4": "mp4", "video/quicktime": "mov", "video/x-m4v": "m4v",
   "audio/mpeg": "mp3", "audio/mp4": "m4a", "audio/x-m4a": "m4a", "audio/aac": "aac", "audio/amr": "amr",
+  // An iPhone voice message is Opus inside Apple's CAF container. Nothing on
+  // Linux registers .caf (shared-mime-info reads it as octet-stream, so
+  // xdg-open had no handler), so fetch rewraps it as Ogg: see rewrapCaf.
+  "audio/x-caf": "ogg",
   "application/pdf": "pdf", "text/plain": "txt", "text/vcard": "vcf", "text/calendar": "ics",
 };
 export function cacheFileName(id: string, name: string, mime: string, preview = false): string {
@@ -125,6 +142,17 @@ function densityRatio(xDpi: number, yDpi: number): number {
 export function imageMetrics(bytes: Buffer, mime: string): ImageMetrics {
   if (!String(mime || "").startsWith("image/") || !bytes || bytes.length < 10)
     return { ...EMPTY_IMAGE_METRICS };
+
+  // GIF: "GIF87a"/"GIF89a" then the logical screen size, u16 little-endian.
+  // Without this an animated GIF reported 0×0 and the bubble had nothing to
+  // size itself from.
+  if (bytes.length >= 10 && bytes.toString("ascii", 0, 3) === "GIF") {
+    return {
+      pixelWidth: bytes.readUInt16LE(6),
+      pixelHeight: bytes.readUInt16LE(8),
+      pixelRatio: 1,                       // GIF carries no density
+    };
+  }
 
   const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
   if (bytes.length >= 24 && bytes.subarray(0, 8).equals(png)) {
@@ -322,6 +350,33 @@ export interface FetchResult {
   pixelRatio: number;
 }
 
+/** An iPhone voice message (CAF, Opus inside) → Ogg Opus, so the default
+ *  audio player opens it. Measured on a real one (2026-09-26): ffmpeg cannot
+ *  read CAF from a pipe (the packet table sits at the END: "Missing packet
+ *  table"), and a stream copy fails too (Apple's Opus carries no OpusHead:
+ *  "No extradata present"), so the bytes go to a private temp file in the
+ *  0700 cache dir and are re-encoded at 48 kb/s. The temp file is always
+ *  removed. Any failure (no ffmpeg, an unreadable stream, output that is not
+ *  Ogg) keeps the original bytes: mpv still probes content, it just arrives
+ *  under an .ogg name. */
+export function rewrapCaf(bytes: Buffer, runner = spawnSync, dir = CACHE_DIR): Buffer {
+  const tmp = join(dir, `.caf-${process.pid}-${Math.random().toString(36).slice(2, 10)}.caf`);
+  try {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const fd = openSync(tmp, "wx", 0o600);
+    try { writeSync(fd, bytes); } finally { closeSync(fd); }
+    const res = runner("ffmpeg", [
+      "-v", "error", "-f", "caf", "-i", tmp, "-vn", "-map_metadata", "-1",
+      "-c:a", "libopus", "-b:a", "48k", "-f", "ogg", "pipe:1",
+    ], { timeout: 60000, maxBuffer: FETCH_MAX_BYTES + (1 << 20) });
+    const out = res.stdout as Buffer | undefined;
+    if (res.status === 0 && out && out.length > 4 && out.subarray(0, 4).toString("latin1") === "OggS") return out;
+  } catch { /* keep the original */ } finally {
+    try { unlinkSync(tmp); } catch { /* never written */ }
+  }
+  return bytes;
+}
+
 export function fetchAttachment(
   id: string,
   name: string,
@@ -335,7 +390,7 @@ export function fetchAttachment(
   if (!/^[0-9]{1,18}$/.test(id)) return fail("bad attachment id");
   mkdirSync(CACHE_DIR, { recursive: true, mode: 0o700 });
 
-  const preview = maxBytes < FETCH_MAX_BYTES && isImageMime(mime);
+  const preview = maxBytes < FETCH_MAX_BYTES && isImageMime(mime) && !isAnimatedMime(mime);
   const file = join(CACHE_DIR, cacheFileName(id, name, mime, preview));
   try {
     const st = lstatSync(file);
@@ -363,7 +418,7 @@ export function fetchAttachment(
     ...(wantsJpeg(mime) || preview ? ["--jpeg"] : []),
     ...(preview ? ["--max-dim", String(PREVIEW_MAX_DIM)] : []),
   ];
-  const res = runner(`${HOME}/bin/imsg`, args, {
+  const res = runner(shimPath("imsg"), args, {
     timeout: 120000,
     maxBuffer: FETCH_MAX_BYTES + (1 << 20),
   });
@@ -375,7 +430,9 @@ export function fetchAttachment(
   const raw = res.stdout as Buffer;
   if (!raw || raw.length === 0) return fail("empty attachment stream");
   if (raw.length > Math.min(maxBytes, FETCH_MAX_BYTES)) return fail("attachment exceeds the fetch ceiling");
-  const bytes = bakeOrientation(raw, runner);
+  const bytes = String(mime || "").toLowerCase() === "audio/x-caf"
+    ? rewrapCaf(raw, runner)
+    : bakeOrientation(raw, runner);
 
   // tmp + fsync + rename: a killed fetch must never leave a cache hit that
   // looks complete.
